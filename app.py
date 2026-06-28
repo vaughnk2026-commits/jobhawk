@@ -69,7 +69,7 @@ def fetch_remotive() -> List[Dict]:
     try:
         r = requests.get("https://remotive.com/api/remote-jobs", timeout=25)
         r.raise_for_status()
-        for item ir r.json().get("jobs", []):
+        for item in r.json().get("jobs", []):
             jobs.append({
                 "source": "Remotive",
                 "title": normalize(item.get("title")),
