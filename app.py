@@ -90,7 +90,7 @@ def fetch_arbeitnow() -> List[Dict]:
     try:
         r = requests.get("https://www.arbeitnow.com/api/job-board-api", timeout=25)
         r.raise_for_status()
-        for item ir r.json().get("data", []):
+        for item in r.json().get("data", []):
             loc = normalize(item.get("location"))
             is_remote = bool(item.get("remote")) or "remote" in loc.lower()
             desc = BeautifulSoup(item.get("description") or "", "html.parser").get_text(" ")
