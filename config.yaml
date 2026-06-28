@@ -1,0 +1,87 @@
+profile:
+  name: Vaughn Krogman
+  location: Calgary, Alberta, Canada
+  email: vaughnk2025@gmail.com
+  phone: '8257791000'
+  target_locations:
+    - Calgary, AB
+    - Alberta
+    - Canada
+    - Remote Canada
+    - Remote
+
+search:
+  max_results_per_run: 500
+  include_remote: true
+  include_canada_wide: true
+  min_score_to_package: 65
+  min_score_to_notify: 75
+  excluded_terms:
+    - entry level
+    - unpaid
+    - volunteer only
+    - internship
+
+roles:
+  primary:
+    - Automotive Finance Manager
+    - F&I Director
+    - Finance Director
+    - Special Finance Manager
+    - General Sales Manager
+    - Sales Manager
+    - Business Development Manager
+    - Dealer Operations Manager
+  secondary:
+    - Automotive SaaS Account Executive
+    - Regional Sales Manager
+    - Dealer Performance Manager
+    - CRM Manager
+    - Digital Retailing Manager
+    - F&I Trainer
+    - Remote B2B Sales
+
+keywords:
+  strongest:
+    - F&I
+    - Finance Manager
+    - Finance Director
+    - Automotive Finance
+    - Special Finance
+    - Credit Rebuild
+    - Lender Relations
+    - PVR
+    - Back-End Gross
+    - Menu Selling
+    - Warranty Penetration
+    - Product Penetration
+    - Dealer Operations
+    - General Sales Manager
+    - Sales Manager
+    - Business Development
+    - CRM
+    - Dealertrack
+    - PBS
+    - VinSolutions
+    - Automotive SaaS
+  support:
+    - Revenue Growth
+    - Team Leadership
+    - Full-Cycle Sales
+    - Compliance
+    - Negotiation
+    - Lead Generation
+    - Digital Marketing
+    - Remote Sales
+    - SaaS
+    - Implementation
+    - Process Improvement
+
+sources:
+  remotive: true
+  arbeitnow: true
+  remoteok: true
+  manual_search_urls:
+    - https://ca.indeed.com/jobs?q=automotive+finance+manager&l=Canada
+    - https://www.linkedin.com/jobs/search/?keywords=Automotive%20Finance%20Manager&location=Canada
+    - https://www.linkedin.com/jobs/search/?keywords=Business%20Development%20Manager%20Automotive&location=Canada
