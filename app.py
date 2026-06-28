@@ -531,4 +531,296 @@ HTML = r"""<!DOCTYPE html>
     <div class="drop-zones">
       <div class="drop-zone" id="resume-zone" ondragover="onDragOver(event,'resume-zone')" ondragleave="onDragLeave('resume-zone')" ondrop="onDrop(event,'resume')">
         <input type="file" accept=".pdf,.doc,.docx,.txt" onchange="onFileSelect(event,'resume')">
-        <div class="drop-icon">📄</div>
+        <div class="drop-icon">📄</div>        <div class="drop-label">Resume</div>
+        <div class="drop-hint">PDF, DOC, DOCX — drag here or click</div>
+        <div class="drop-filename" id="resume-filename"></div>
+      </div>
+      <div class="drop-zone" id="cl-zone" ondragover="onDragOver(event,'cl-zone')" ondragleave="onDragLeave('cl-zone')" ondrop="onDrop(event,'cover_letter')">
+        <input type="file" accept=".pdf,.doc,.docx,.txt" onchange="onFileSelect(event,'cover_letter')">
+        <div class="drop-icon">📝</div>
+        <div class="drop-label">Cover Letter</div>
+        <div class="drop-hint">PDF, DOC, DOCX — drag here or click</div>
+        <div class="drop-filename" id="cl-filename"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Filters -->
+  <div class="filters">
+    <div class="filter-group">
+      <span class="filter-label">Location</span>
+      <select id="loc-filter" onchange="applyFilters()">
+        <option value="all">All Locations</option>
+        <option value="remote">Remote</option>
+        <option value="canada">Canada</option>
+        <option value="usa">USA</option>
+        <option value="europe">Europe</option>
+        <option value="worldwide">Worldwide</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <span class="filter-label">Source</span>
+      <select id="src-filter" onchange="applyFilters()">
+        <option value="all">All Sources</option>
+        <option value="Remotive">Remotive</option>
+        <option value="Arbeitnow">Arbeitnow</option>
+        <option value="RemoteOK">RemoteOK</option>
+        <option value="WeWorkRemotely">WeWorkRemotely</option>
+        <option value="Jobicy">Jobicy</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <span class="filter-label">Search</span>
+      <input type="text" id="search-box" placeholder="title, company..." oninput="applyFilters()" style="width:200px">
+    </div>
+    <div class="filter-group">
+      <span class="filter-label">Min Score: <span id="score-val">0</span></span>
+      <div class="range-row">
+        <input type="range" id="score-range" min="0" max="100" value="0" oninput="document.getElementById('score-val').textContent=this.value;applyFilters()" style="width:120px">
+      </div>
+    </div>
+    <span id="count-badge">0 jobs</span>
+  </div>
+
+  <!-- Job Cards -->
+  <div class="jobs-grid" id="jobs-grid">
+    <div class="empty">
+      <div class="empty-icon">&#x1f985;</div>
+      <h2>No jobs loaded yet</h2>
+      <p>Click <strong>Run Now</strong> to fetch jobs from all sources.</p>
+    </div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const LOC_MAP = {
+  remote: ['remote'],
+  canada: ['canada','calgary','alberta','ca ','toronto','vancouver'],
+  usa: ['united states','usa',' us ','u.s.','america','new york','california'],
+  europe: ['europe','uk','germany','france','netherlands','spain','eu'],
+  worldwide: ['worldwide','anywhere','global','international'],
+};
+
+let ALL_JOBS = [];
+
+function showToast(msg, isError) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast' + (isError ? ' error' : '');
+  t.style.display = 'block';
+  setTimeout(function(){ t.style.display = 'none'; }, 3500);
+}
+
+async function loadStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    document.getElementById('last-run').textContent = d.last_run || '---';
+    document.getElementById('run-status').textContent = d.last_run_status || '---';
+    document.getElementById('job-count').textContent = d.job_count != null ? d.job_count : '---';
+    document.getElementById('packet-count').textContent = d.packet_count != null ? d.packet_count : '---';
+    if (d.resume_name) {
+      const el = document.getElementById('resume-status');
+      el.textContent = d.resume_name; el.style.color = 'var(--accent2)';
+    }
+    if (d.cover_letter_name) {
+      const el = document.getElementById('cl-status');
+      el.textContent = d.cover_letter_name; el.style.color = 'var(--accent2)';
+    }
+    const btn = document.getElementById('run-btn');
+    btn.disabled = !!d.running;
+    btn.textContent = d.running ? 'Running...' : 'Run Now';
+  } catch(e) {}
+}
+
+async function loadJobs() {
+  try {
+    const r = await fetch('/api/jobs');
+    ALL_JOBS = await r.json();
+    applyFilters();
+  } catch(e) {}
+}
+
+function scoreClass(s) {
+  if (s >= 65) return 'score-high';
+  if (s >= 35) return 'score-mid';
+  return 'score-low';
+}
+
+function applyFilters() {
+  const loc = document.getElementById('loc-filter').value;
+  const src = document.getElementById('src-filter').value;
+  const q = document.getElementById('search-box').value.toLowerCase();
+  const minScore = parseInt(document.getElementById('score-range').value) || 0;
+  const filtered = ALL_JOBS.filter(function(j) {
+    const locStr = (j.location || '').toLowerCase();
+    if (loc !== 'all') {
+      const kws = LOC_MAP[loc] || [];
+      if (!kws.some(function(k){ return locStr.includes(k); })) return false;
+    }
+    if (src !== 'all' && j.source !== src) return false;
+    if (q && !(j.title+' '+j.company+' '+j.location).toLowerCase().includes(q)) return false;
+    if ((parseInt(j.match_score)||0) < minScore) return false;
+    return true;
+  });
+  document.getElementById('count-badge').textContent = filtered.length + ' jobs';
+  const grid = document.getElementById('jobs-grid');
+  if (!filtered.length) {
+    grid.innerHTML = '<div class="empty"><div class="empty-icon">&#x1f50d;</div><h2>No jobs match</h2><p>Try adjusting your filters.</p></div>';
+    return;
+  }
+  grid.innerHTML = filtered.map(function(j) {
+    const sc = parseInt(j.match_score) || 0;
+    const cls = scoreClass(sc);
+    const remote = j.remote === 'True' || j.remote === true;
+    return '<div class="job-card">'
+      + '<div class="score-ring ' + cls + '">' + sc + '</div>'
+      + '<div class="job-info">'
+      + '<div class="job-title">' + (j.title||'') + '</div>'
+      + '<div class="job-company">' + (j.company||'') + '</div>'
+      + '<div class="job-meta">'
+      + (remote ? '<span class="tag tag-remote">Remote</span>' : '')
+      + '<span class="tag">' + (j.location||'') + '</span>'
+      + '<span class="tag tag-source">' + (j.source||'') + '</span>'
+      + '</div></div>'
+      + '<div class="job-actions">'
+      + '<a class="apply-btn" href="' + (j.url||'#') + '" target="_blank" rel="noopener">Apply</a>'
+      + '<div class="date-tag">' + (j.date_posted||'') + '</div>'
+      + '</div></div>';
+  }).join('');
+}
+
+async function runNow() {
+  document.getElementById('run-btn').disabled = true;
+  document.getElementById('run-btn').textContent = 'Running...';
+  try {
+    const r = await fetch('/api/run', {method:'POST'});
+    const d = await r.json();
+    if (d.error) showToast('Error: ' + d.error, true);
+    else showToast('Done - ' + d.jobs + ' jobs, ' + d.packets + ' packets');
+  } catch(e) { showToast('Request failed', true); }
+  await loadStatus();
+  await loadJobs();
+}
+
+function downloadCSV() { window.open('/api/download', '_blank'); }
+
+function onDragOver(e, zoneId) {
+  e.preventDefault();
+  document.getElementById(zoneId).classList.add('dragover');
+}
+function onDragLeave(zoneId) {
+  document.getElementById(zoneId).classList.remove('dragover');
+}
+function onDrop(e, fileType) {
+  e.preventDefault();
+  const zoneId = fileType === 'resume' ? 'resume-zone' : 'cl-zone';
+  document.getElementById(zoneId).classList.remove('dragover');
+  const file = e.dataTransfer.files[0];
+  if (file) uploadFile(file, fileType);
+}
+function onFileSelect(e, fileType) {
+  const file = e.target.files[0];
+  if (file) uploadFile(file, fileType);
+}
+async function uploadFile(file, fileType) {
+  const zoneId = fileType === 'resume' ? 'resume-zone' : 'cl-zone';
+  const nameEl = document.getElementById(fileType === 'resume' ? 'resume-filename' : 'cl-filename');
+  const statusEl = document.getElementById(fileType === 'resume' ? 'resume-status' : 'cl-status');
+  nameEl.textContent = 'Uploading...';
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('type', fileType);
+    const r = await fetch('/api/upload', {method:'POST', body:fd});
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById(zoneId).classList.add('uploaded');
+      nameEl.textContent = d.name;
+      statusEl.textContent = d.name;
+      statusEl.style.color = 'var(--accent2)';
+      showToast('Uploaded: ' + d.name);
+    } else { nameEl.textContent = 'Upload failed'; showToast('Upload failed', true); }
+  } catch(e) { nameEl.textContent = 'Error'; showToast('Upload error', true); }
+}
+
+loadStatus();
+loadJobs();
+setInterval(loadStatus, 15000);
+setInterval(loadJobs, 60000);
+</script>
+</body>
+</html>"""
+
+
+# ── Flask routes ──────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+
+@app.route("/api/status")
+def api_status():
+    with _state_lock:
+        return jsonify(dict(_state))
+
+
+@app.route("/api/jobs")
+def api_jobs():
+    return jsonify(load_scored_jobs())
+
+
+@app.route("/api/run", methods=["POST"])
+def api_run():
+    import threading
+    t = threading.Thread(target=run_all, daemon=True)
+    t.start()
+    return jsonify({"ok": True, "message": "Run started"})
+
+
+@app.route("/api/download")
+def api_download():
+    path = DATA / "jobs_scored.csv"
+    if not path.exists():
+        return jsonify({"error": "No data yet"}), 404
+    return send_file(str(path), mimetype="text/csv",
+                     as_attachment=True, download_name="jobhawk_results.csv")
+
+
+@app.route("/api/upload", methods=["POST"])
+def api_upload():
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "no file"}), 400
+    f = request.files["file"]
+    file_type = request.form.get("type", "resume")
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", f.filename)
+    dest = UPLOADS / f"{file_type}_{safe_name}"
+    f.save(str(dest))
+    with _state_lock:
+        if file_type == "resume":
+            _state["resume_name"] = f.filename
+        else:
+            _state["cover_letter_name"] = f.filename
+    return jsonify({"ok": True, "name": f.filename, "type": file_type})
+
+
+# ── scheduler ─────────────────────────────────────────────────────────────────
+
+def _bg_run():
+    log.info("Scheduled run starting")
+    run_all()
+
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(_bg_run, "interval", hours=4, id="jobhawk_scan")
+scheduler.start()
+
+import threading as _th
+_th.Thread(target=_bg_run, daemon=True).start()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
