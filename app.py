@@ -4,6 +4,7 @@ Run with: python app.py
 Then open: http://localhost:5000
 """
 
+import concurrent.futures
 import csv
 import datetime as dt
 import json
@@ -11,6 +12,7 @@ import logging
 import os
 import re
 import threading
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -18,7 +20,7 @@ import requests
 import yaml
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template_string, send_file
+from flask import Flask, jsonify, render_template_string, request, send_file
 from apscheduler.schedulers.background import BackgroundScheduler
 
 load_dotenv()
@@ -28,8 +30,9 @@ DATA = BASE / "data"
 OUTPUT = BASE / "output"
 LOGS = BASE / "logs"
 PACKETS = OUTPUT / "application_packets"
+UPLOADS = BASE / "uploads"
 
-for folder in [DATA, OUTPUT, LOGS, PACKETS]:
+for folder in [DATA, OUTPUT, LOGS, PACKETS, UPLOADS]:
     folder.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -40,6 +43,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB
 
 # ── shared state ──────────────────────────────────────────────────────────────
 _state: Dict[str, Any] = {
@@ -49,19 +53,21 @@ _state: Dict[str, Any] = {
     "job_count": 0,
     "packet_count": 0,
     "run_count": 0,
+    "resume_name": None,
+    "cover_letter_name": None,
 }
 _state_lock = threading.Lock()
 
 
-# ── core logic ────────────────────────────────────────────────────────────────
+# ── job fetchers ──────────────────────────────────────────────────────────────
+
+def normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
 
 def load_config() -> Dict[str, Any]:
     with open(BASE / "config.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
-
-def normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "")).strip()
 
 
 def fetch_remotive() -> List[Dict]:
@@ -111,14 +117,140 @@ def fetch_arbeitnow() -> List[Dict]:
     return jobs
 
 
-def search_jobs(cfg) -> List[Dict]:
+def fetch_remoteok() -> List[Dict]:
     jobs = []
-    if cfg["sources"].get("remotive"):
-        jobs.extend(fetch_remotive())
-    if cfg["sources"].get("arbeitnow"):
-        jobs.extend(fetch_arbeitnow())
+    try:
+        r = requests.get(
+            "https://remoteok.io/api", timeout=25,
+            headers={"User-Agent": "JobHawk/1.0 (job search bot)"}
+        )
+        r.raise_for_status()
+        data = r.json()
+        # First element is legal/metadata notice — skip it
+        for item in (data[1:] if len(data) > 1 else []):
+            if not isinstance(item, dict) or not item.get("position"):
+                continue
+            tags = " ".join(item.get("tags") or [])
+            desc = BeautifulSoup(item.get("description") or "", "html.parser").get_text(" ")
+            jobs.append({
+                "source": "RemoteOK",
+                "title": normalize(item.get("position")),
+                "company": normalize(item.get("company")),
+                "location": normalize(item.get("location") or "Remote"),
+                "remote": True,
+                "url": item.get("url") or f"https://remoteok.io/remote-jobs/{item.get('id','')}",
+                "date_posted": str(item.get("date") or ""),
+                "description": f"{desc} {tags}",
+            })
+    except Exception as e:
+        log.exception("RemoteOK fetch failed: %s", e)
+    return jobs
 
-    for url in cfg["sources"].get("manual_search_urls", []):
+
+def fetch_weworkremotely() -> List[Dict]:
+    jobs = []
+    try:
+        r = requests.get(
+            "https://weworkremotely.com/remote-jobs.rss", timeout=25,
+            headers={"User-Agent": "JobHawk/1.0"}
+        )
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        for item in root.findall(".//item"):
+            def txt(tag):
+                el = item.find(tag)
+                return (el.text or "") if el is not None else ""
+            raw_title = txt("title")
+            # WWR format: "Company: Job Title"
+            parts = raw_title.split(":", 1)
+            company = normalize(parts[0]) if len(parts) > 1 else ""
+            title = normalize(parts[1]) if len(parts) > 1 else normalize(raw_title)
+            desc = BeautifulSoup(txt("description"), "html.parser").get_text(" ")
+            url = txt("link") or txt("guid")
+            jobs.append({
+                "source": "WeWorkRemotely",
+                "title": title,
+                "company": company,
+                "location": "Remote",
+                "remote": True,
+                "url": url,
+                "date_posted": normalize(txt("pubDate")),
+                "description": desc,
+            })
+    except Exception as e:
+        log.exception("WeWorkRemotely fetch failed: %s", e)
+    return jobs
+
+
+def fetch_jobicy() -> List[Dict]:
+    jobs = []
+    try:
+        r = requests.get(
+            "https://jobicy.com/?feed=job_feed", timeout=25,
+            headers={"User-Agent": "JobHawk/1.0"}
+        )
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        for item in root.findall(".//item"):
+            def txt(tag):
+                el = item.find(tag)
+                return (el.text or "") if el is not None else ""
+            title = normalize(txt("title"))
+            url = txt("link") or txt("guid")
+            desc = BeautifulSoup(txt("description"), "html.parser").get_text(" ")
+            pub = normalize(txt("pubDate"))
+            # Try namespaced company tag
+            company = ""
+            for child in item:
+                if "company" in child.tag.lower():
+                    company = normalize(child.text or "")
+                    break
+            # Fall back: "Title @ Company" pattern
+            if not company and " @ " in title:
+                parts = title.split(" @ ", 1)
+                title, company = normalize(parts[0]), normalize(parts[1])
+            jobs.append({
+                "source": "Jobicy",
+                "title": title,
+                "company": company or "—",
+                "location": "Remote",
+                "remote": True,
+                "url": url,
+                "date_posted": pub,
+                "description": desc,
+            })
+    except Exception as e:
+        log.exception("Jobicy fetch failed: %s", e)
+    return jobs
+
+
+def search_jobs(cfg) -> List[Dict]:
+    """Run all enabled sources in parallel for maximum speed."""
+    source_cfg = cfg.get("sources", {})
+
+    fetcher_map = {
+        "remotive": (fetch_remotive, source_cfg.get("remotive", True)),
+        "arbeitnow": (fetch_arbeitnow, source_cfg.get("arbeitnow", True)),
+        "remoteok": (fetch_remoteok, source_cfg.get("remoteok", True)),
+        "weworkremotely": (fetch_weworkremotely, source_cfg.get("weworkremotely", True)),
+        "jobicy": (fetch_jobicy, source_cfg.get("jobicy", True)),
+    }
+
+    active = [fn for _, (fn, enabled) in fetcher_map.items() if enabled]
+
+    jobs: List[Dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(active)) as ex:
+        futures = {ex.submit(fn): fn.__name__ for fn in active}
+        for fut in concurrent.futures.as_completed(futures, timeout=60):
+            name = futures[fut]
+            try:
+                result = fut.result()
+                jobs.extend(result)
+                log.info("%s returned %s jobs", name, len(result))
+            except Exception as e:
+                log.exception("Fetcher %s raised: %s", name, e)
+
+    for url in source_cfg.get("manual_search_urls", []):
         jobs.append({
             "source": "Manual Search URL",
             "title": "Search results feed",
@@ -137,9 +269,12 @@ def search_jobs(cfg) -> List[Dict]:
             seen.add(key)
             deduped.append(j)
 
-    deduped = deduped[:cfg["search"].get("max_results_per_run", 500)]
-    (DATA / "jobs_raw.json").write_text(json.dumps(deduped, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info("Fetched %s jobs", len(deduped))
+    max_results = cfg["search"].get("max_results_per_run", 1000)
+    deduped = deduped[:max_results]
+    (DATA / "jobs_raw.json").write_text(
+        json.dumps(deduped, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    log.info("Total unique jobs fetched: %s", len(deduped))
     return deduped
 
 
@@ -185,7 +320,9 @@ def score_jobs(cfg, jobs: List[Dict]) -> List[Dict]:
 
 def choose_summary(job: Dict) -> str:
     try:
-        variants = yaml.safe_load((BASE / "templates" / "resume_summary_variants.yaml").read_text(encoding="utf-8"))
+        variants = yaml.safe_load(
+            (BASE / "templates" / "resume_summary_variants.yaml").read_text(encoding="utf-8")
+        )
     except Exception:
         return "See attached resume."
     text = f"{job.get('title','')} {job.get('description','')}".lower()
@@ -310,14 +447,31 @@ HTML = r"""<!DOCTYPE html>
   .pulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent2);margin-right:6px;animation:pulse 1.5s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
   main{padding:24px 32px;max-width:1400px;margin:0 auto}
+
+  /* ── drop zone ── */
+  .drop-panel{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px 24px;margin-bottom:20px}
+  .drop-panel-title{font-size:13px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:14px}
+  .drop-zones{display:flex;gap:12px;flex-wrap:wrap}
+  .drop-zone{flex:1;min-width:200px;border:2px dashed var(--border);border-radius:10px;padding:20px;text-align:center;cursor:pointer;transition:border-color .2s,background .2s;position:relative}
+  .drop-zone:hover,.drop-zone.dragover{border-color:var(--accent);background:rgba(79,142,247,.06)}
+  .drop-zone.uploaded{border-color:var(--accent2);background:rgba(34,211,164,.06)}
+  .drop-zone input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
+  .drop-icon{font-size:28px;margin-bottom:8px}
+  .drop-label{font-size:14px;font-weight:600;color:var(--text)}
+  .drop-hint{font-size:12px;color:var(--muted);margin-top:4px}
+  .drop-filename{font-size:12px;color:var(--accent2);font-weight:600;margin-top:6px;word-break:break-all}
+
+  /* ── filters ── */
   .filters{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap;align-items:flex-end}
   .filter-group{display:flex;flex-direction:column;gap:4px}
   .filter-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
-  select,input{background:var(--card);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:7px 12px;font-size:13px;outline:none}
-  select:focus,input:focus{border-color:var(--accent)}
+  select,input[type=text],input[type=range]{background:var(--card);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:7px 12px;font-size:13px;outline:none}
+  select:focus,input[type=text]:focus{border-color:var(--accent)}
   .range-row{display:flex;gap:8px;align-items:center}
   .range-val{font-size:13px;font-weight:600;color:var(--accent);min-width:28px}
   #count-badge{font-size:13px;color:var(--muted);padding:6px 14px;background:var(--card);border:1px solid var(--border);border-radius:6px;align-self:flex-end}
+
+  /* ── job cards ── */
   .jobs-grid{display:grid;gap:12px}
   .job-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 20px;display:grid;grid-template-columns:64px 1fr auto;gap:16px;align-items:start;transition:border-color .15s}
   .job-card:hover{border-color:var(--accent)}
@@ -340,8 +494,9 @@ HTML = r"""<!DOCTYPE html>
   .empty-icon{font-size:48px;margin-bottom:12px}
   .empty h2{font-size:20px;margin-bottom:8px;color:var(--text)}
   .toast{position:fixed;bottom:24px;right:24px;background:var(--card);border:1px solid var(--accent2);border-radius:10px;padding:14px 20px;font-size:14px;font-weight:600;color:var(--accent2);display:none;z-index:999;animation:slideIn .3s ease}
+  .toast.error{border-color:var(--low);color:var(--low)}
   @keyframes slideIn{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
-  @media(max-width:700px){header,.status-bar,main{padding-left:16px;padding-right:16px}.job-card{grid-template-columns:48px 1fr}.job-actions{display:none}}
+  @media(max-width:700px){header,.status-bar,main{padding-left:16px;padding-right:16px}.job-card{grid-template-columns:48px 1fr}.job-actions{display:none}.drop-zones{flex-direction:column}}
 </style>
 </head>
 <body>
@@ -365,222 +520,15 @@ HTML = r"""<!DOCTYPE html>
   <div class="stat"><span class="stat-label">Jobs Found</span><span class="stat-value" id="job-count">—</span></div>
   <div class="stat"><span class="stat-label">Packets Ready</span><span class="stat-value" id="packet-count">—</span></div>
   <div class="stat"><span class="stat-label">Next Auto-Run</span><span class="stat-value"><span class="pulse"></span><span id="next-run">4h</span></span></div>
+  <div class="stat"><span class="stat-label">Resume</span><span class="stat-value" id="resume-status" style="font-size:12px;color:var(--muted)">Not uploaded</span></div>
+  <div class="stat"><span class="stat-label">Cover Letter</span><span class="stat-value" id="cl-status" style="font-size:12px;color:var(--muted)">Not uploaded</span></div>
 </div>
 
 <main>
-  <div class="filters">
-    <div class="filter-group">
-      <span class="filter-label">Min Score</span>
-      <div class="range-row">
-        <input type="range" id="min-score" min="0" max="100" value="0" step="5" oninput="filterJobs()">
-        <span class="range-val" id="min-score-val">0</span>
-      </div>
-    </div>
-    <div class="filter-group">
-      <span class="filter-label">Source</span>
-      <select id="filter-source" onchange="filterJobs()">
-        <option value="">All Sources</option>
-        <option>Remotive</option>
-        <option>Arbeitnow</option>
-        <option>Manual Search URL</option>
-      </select>
-    </div>
-    <div class="filter-group">
-      <span class="filter-label">Remote</span>
-      <select id="filter-remote" onchange="filterJobs()">
-        <option value="">All</option>
-        <option value="true">Remote only</option>
-      </select>
-    </div>
-    <div class="filter-group">
-      <span class="filter-label">Search</span>
-      <input type="text" id="search-box" placeholder="Title, company…" oninput="filterJobs()">
-    </div>
-    <span id="count-badge">— jobs</span>
-  </div>
-
-  <div class="jobs-grid" id="jobs-grid">
-    <div class="empty">
-      <div class="empty-icon">🔍</div>
-      <h2>Loading…</h2>
-      <p>Scanning job boards automatically on startup</p>
-    </div>
-  </div>
-</main>
-
-<div class="toast" id="toast"></div>
-
-<script>
-let allJobs = [];
-let countdown = 14400; // 4 hours in seconds
-
-async function fetchStatus() {
-  try {
-    const d = await (await fetch('/api/status')).json();
-    document.getElementById('last-run').textContent = d.last_run || '—';
-    document.getElementById('run-status').textContent = d.last_run_status || '—';
-    document.getElementById('job-count').textContent = d.job_count ?? '—';
-    document.getElementById('packet-count').textContent = d.packet_count ?? '—';
-    const btn = document.getElementById('run-btn');
-    btn.disabled = d.running;
-    btn.textContent = d.running ? '⏳ Running…' : '▶ Run Now';
-    if (d.running) setTimeout(fetchStatus, 3000);
-  } catch(e) {}
-}
-
-async function fetchJobs() {
-  try {
-    allJobs = await (await fetch('/api/jobs')).json();
-    filterJobs();
-  } catch(e) {}
-}
-
-function scoreClass(s) {
-  return s >= 65 ? 'score-high' : s >= 40 ? 'score-mid' : 'score-low';
-}
-
-function filterJobs() {
-  const minScore = parseInt(document.getElementById('min-score').value);
-  document.getElementById('min-score-val').textContent = minScore;
-  const src = document.getElementById('filter-source').value;
-  const remoteOnly = document.getElementById('filter-remote').value === 'true';
-  const q = document.getElementById('search-box').value.toLowerCase();
-
-  const filtered = allJobs.filter(j => {
-    if (j.match_score < minScore) return false;
-    if (src && j.source !== src) return false;
-    if (remoteOnly && j.remote !== 'True' && j.remote !== true) return false;
-    if (q && !`${j.title} ${j.company}`.toLowerCase().includes(q)) return false;
-    return true;
-  });
-
-  document.getElementById('count-badge').textContent = filtered.length + ' jobs';
-  const grid = document.getElementById('jobs-grid');
-
-  if (!filtered.length) {
-    grid.innerHTML = '<div class="empty"><div class="empty-icon">🔍</div><h2>No matches</h2><p>Adjust filters or run a fresh scan</p></div>';
-    return;
-  }
-
-  grid.innerHTML = filtered.slice(0, 300).map(j => `
-    <div class="job-card">
-      <div class="score-ring ${scoreClass(j.match_score)}">${j.match_score}</div>
-      <div class="job-info">
-        <div class="job-title" title="${j.title}">${j.title || '(untitled)'}</div>
-        <div class="job-company">${j.company || '—'}</div>
-        <div class="job-meta">
-          <span class="tag">📍 ${j.location || 'Unknown'}</span>
-          ${(j.remote === 'True' || j.rEmote === true) ? '<span class="tag tag-remote">🌐 Remote</span>' : ''}
-          <span class="tag tag-source">${j.source}</span>
-          ${j.date_posted ? '<span class="tag">📅 ' + (j.date_posted || '').substring(0,10) + '</span>' : ''}
-        </div>
-      </div>
-      <div class="job-actions">
-        ${j.url ? '<a class="apply-btn" href="' + j.url + '" target="_blank" rel="noopener">Apply →</a>' : ''}
-        <span class="date-tag">Score ${j.match_score}/100</span>
-      </div>
-    </div>
-  `).join('');
-}
-
-async function runNow() {
-  const btn = document.getElementById('run-btn');
-  btn.disabled = true;
-  btn.textContent = '⏳ Running…';
-  showToast('🚀 Scan started…');
-  try {
-    const d = await (await fetch('/api/run', {method:'POST'})).json();
-    if (d.error) { showToast('⚠ ' + d.error, 4000); }
-    else {
-      showToast('✅ Done — ' + d.jobs + ' jobs, ' + d.packets + ' packets', 4000);
-      await fetchJobs();
-      countdown = 14400;
-    }
-  } catch(e) { showToast('⚠ Request failed', 4000); }
-  await fetchStatus();
-}
-
-function downloadCSV() { window.location.href = '/api/export'; }
-
-function showToast(msg, ms=3000) {
-  const t = document.getElementById('toast');
-  t.textContent = msg; t.style.display = 'block';
-  setTimeout(() => t.style.display = 'none', ms);
-}
-
-function fmtCountdown(s) {
-  if (s >= 3600) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
-  if (s >= 60) return Math.floor(s/60) + 'm ' + (s%60) + 's';
-  return s + 's';
-}
-
-setInterval(async () => {
-  countdown = Math.max(0, countdown - 1);
-  document.getElementById('next-run').textContent = fmtCountdown(countdown);
-  if (countdown === 0) { countdown = 14400; await fetchStatus(); await fetchJobs(); }
-}, 1000);
-
-// Poll status every 5s while running
-setInterval(fetchStatus, 5000);
-
-(async () => {
-  await fetchStatus();
-  await fetchJobs();
-})();
-</script>
-</body>
-</html>
-"""
-
-
-# ── Flask routes ──────────────────────────────────────────────────────────────
-
-@app.route("/")
-def index():
-    return render_template_string(HTML)
-
-
-@app.route("/api/status")
-def api_status():
-    with _state_lock:
-        return jsonify(dict(_state))
-
-
-@app.route("/api/jobs")
-def api_jobs():
-    return jsonify(load_scored_jobs())
-
-
-@app.route("/api/run", methods=["POST"])
-def api_run():
-    return jsonify(run_all())
-
-
-@app.route("/api/export")
-def api_export():
-    path = DATA / "jobs_scored.csv"
-    if not path.exists():
-        return jsonify({"error": "No data yet. Run a scan first."}), 404
-    return send_file(str(path), as_attachment=True, download_name="jobhawk_results.csv")
-
-
-# ── scheduler & startup ───────────────────────────────────────────────────────
-
-# Start scheduler when module loads (works with both gunicorm and direct run)
-_scheduler = BackgroundScheduler(daemon=True)
-_scheduler.add_job(run_all, "interval", hours=4, id="jobhawk_auto")
-_scheduler.start()
-
-# Run first scan in background immediately on startup
-threading.Thread(target=run_all, daemon=True).start()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    print("=" * 55)
-    print("  🦅  JobHawk Web — Vaughn Krogman")
-    print("=" * 55)
-    print(f"  Dashboard:  http://localhost:{port}")
-    print("  Auto-run:   every 4 hours")
-    print("  Press Ctrl+C to stop")
-    print("=" * 55)
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False) 
+  <!-- Resume + Cover Letter Drop Zones -->
+  <div class="drop-panel">
+    <div class="drop-panel-title">📎 Drop Your Files — uploads automatically on drop</div>
+    <div class="drop-zones">
+      <div class="drop-zone" id="resume-zone" ondragover="onDragOver(event,'resume-zone')" ondragleave="onDragLeave('resume-zone')" ondrop="onDrop(event,'resume')">
+        <input type="file" accept=".pdf,.doc,.docx,.txt" onchange="onFileSelect(event,'resume')">
+        <div class="drop-icon">📄</div>
