@@ -44,7 +44,8 @@
       <span id="email-status">—</span>
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn btn-primary btn-sm" onclick="runNow()">▶ Scan Now</button>
+      <button id="btn-scan" class="btn btn-primary btn-sm" onclick="runNow()">▶ Scan Now</button>
+      <button id="btn-stop" class="btn btn-danger btn-sm" onclick="stopScan()" style="display:none">⏹ Stop Scan</button>
       <button class="btn btn-ghost btn-sm" onclick="downloadCSV()">⬇ Export CSV</button>
     </div>
   </div>
@@ -227,7 +228,10 @@ async function loadStatus() {
     document.getElementById('cnt-interviews').textContent = d.interview  ?? 0;
     document.getElementById('email-status').textContent  =
       d.email_configured ? '📧 Email configured' : '⚠ No email — set up in Settings';
-    document.getElementById('status-indicator').style.display = d.running ? 'inline' : 'none';
+    const _running = !!d.running;
+    document.getElementById('status-indicator').style.display = _running ? 'inline' : 'none';
+    document.getElementById('btn-scan').style.display = _running ? 'none' : 'inline-flex';
+    document.getElementById('btn-stop').style.display = _running ? 'inline-flex' : 'none';
     if (d.resume_name) {
       document.getElementById('dz-resume').classList.add('has-file');
       document.getElementById('dz-resume-lbl').textContent = '✅ ' + d.resume_name;
@@ -367,6 +371,11 @@ async function setStatus(id, status) {
   });
   toast('Marked as ' + status);
   loadStatus(); loadApplied(); loadInterviews();
+}
+
+async function stopScan() {
+  await fetch('/api/stop', {method:'POST'});
+  toast('Stopping scan...');
 }
 
 async function runNow() {

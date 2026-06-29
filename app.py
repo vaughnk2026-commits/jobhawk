@@ -75,7 +75,8 @@ _scan_state = {
     "running": False, "last_ran": None,
     "last_status": "Never run", "run_count": 0,
 }
-_scan_lock = threading.Lock()
+_scan_lock  = threading.Lock()
+_stop_event = threading.Event()    # set() to request scan cancellation
 
 MAX_APPLY_PER_RUN = 30   # cap applications per scan to avoid SMTP hangs
 
@@ -87,6 +88,7 @@ def _run_scan():
             return
         _scan_state["running"]     = True
         _scan_state["last_status"] = "Fetching jobs..."
+    _stop_event.clear()
     try:
         log.info("Scan started")
         raw_jobs = scrapers.fetch_all_jobs()
@@ -94,16 +96,22 @@ def _run_scan():
         with _scan_lock:
             _scan_state["last_status"] = f"Scoring {len(raw_jobs)} jobs..."
         for uid in models.user_all_ids():
+            if _stop_event.is_set():
+                log.info("Scan cancelled by user")
+                break
             try:
                 _process_user(uid, raw_jobs)
             except Exception as ue:
                 log.exception("User %s error: %s", uid, ue)
+        stopped = _stop_event.is_set()
         now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with _scan_lock:
             _scan_state["last_ran"]    = now
-            _scan_state["last_status"] = f"Done — {len(raw_jobs)} jobs found"
+            _scan_state["last_status"] = (
+                f"Stopped at {now}" if stopped else f"Done — {len(raw_jobs)} jobs found"
+            )
             _scan_state["run_count"]  += 1
-        log.info("Scan done: %d jobs", len(raw_jobs))
+        log.info("Scan %s: %d jobs", "stopped" if stopped else "done", len(raw_jobs))
     except Exception as e:
         log.exception("Scan error: %s", e)
         with _scan_lock:
@@ -325,6 +333,15 @@ def api_profile_post():
     update = {k: v for k, v in data.items() if k in allowed}
     if update:
         models.profile_update(current_user.id, **update)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/stop", methods=["POST"])
+@login_required
+def api_stop():
+    _stop_event.set()
+    with _scan_lock:
+        _scan_state["last_status"] = "Stopping..."
     return jsonify({"ok": True})
 
 # ── Passkeys ──────────────────────────────────────────────────────────────────
