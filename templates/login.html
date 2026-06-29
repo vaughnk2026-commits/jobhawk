@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}Sign In — JobHawk{% endblock %}
+{% block content %}
+<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px">
+  <div style="width:100%;max-width:420px">
+    <div style="text-align:center;margin-bottom:32px">
+      <div style="font-size:2.5rem;margin-bottom:8px">🦅</div>
+      <h1 style="font-size:1.8rem;font-weight:800;color:#60a5fa">JobHawk</h1>
+      <p style="color:#64748b;margin-top:6px">Automated job search &amp; applications</p>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:1.1rem;font-weight:700;margin-bottom:20px">Sign in to your account</h2>
+
+      {% if error %}
+      <div class="error-msg">{{ error }}</div>
+      {% endif %}
+
+      <form method="POST" action="/login">
+        <div class="form-group">
+          <label>Email address</label>
+          <input class="form-input" type="email" name="email" placeholder="you@example.com" required autofocus>
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input class="form-input" type="password" name="password" placeholder="••••••••" required>
+        </div>
+        <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center;margin-top:4px">
+          Sign In
+        </button>
+      </form>
+
+      <div style="text-align:center;margin:20px 0;color:#334155;font-size:.85rem">— or —</div>
+
+      <button id="passkey-btn" class="btn btn-secondary" style="width:100%;justify-content:center" onclick="signInWithPasskey()">
+        🔑 Sign in with Passkey
+      </button>
+
+      <p style="text-align:center;margin-top:20px;font-size:.85rem;color:#64748b">
+        Don't have an account? <a href="/signup">Create one free</a>
+      </p>
+    </div>
+  </div>
+</div>
+
+<script>
+async function b64ToBuffer(b64) {
+  const bin = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
+  return Uint8Array.from(bin, c => c.charCodeAt(0));
+}
+function bufToB64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+
+async function signInWithPasskey() {
+  if (!window.PublicKeyCredential) {
+    alert('This browser does not support passkeys.');
+    return;
+  }
+  try {
+    const r1 = await fetch('/auth/passkey/authenticate/begin', {method:'POST'});
+    const opts = await r1.json();
+    if (opts.error) { alert('Passkey error: ' + opts.error); return; }
+
+    opts.challenge = await b64ToBuffer(opts.challenge);
+    if (opts.allowCredentials) {
+      opts.allowCredentials = await Promise.all(
+        opts.allowCredentials.map(async c => ({...c, id: await b64ToBuffer(c.id)}))
+      );
+    }
+
+    const assertion = await navigator.credentials.get({publicKey: opts});
+
+    const payload = {
+      id: assertion.id,
+      rawId: bufToB64(assertion.rawId),
+      type: assertion.type,
+      response: {
+        authenticatorData: bufToB64(assertion.response.authenticatorData),
+        clientDataJSON:    bufToB64(assertion.response.clientDataJSON),
+        signature:         bufToB64(assertion.response.signature),
+        userHandle: assertion.response.userHandle ? bufToB64(assertion.response.userHandle) : null,
+      }
+    };
+
+    const r2 = await fetch('/auth/passkey/authenticate/complete', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await r2.json();
+    if (d.ok) { window.location = '/dashboard'; }
+    else { alert('Passkey authentication failed: ' + (d.error||'unknown error')); }
+  } catch(e) {
+    if (e.name !== 'NotAllowedError') alert('Passkey error: ' + e.message);
+  }
+}
+</script>
+{% endblock %}

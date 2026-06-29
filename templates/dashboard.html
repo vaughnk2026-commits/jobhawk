@@ -1,0 +1,462 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — JobHawk{% endblock %}
+
+{% block nav %}
+<nav>
+  <span class="logo">🦅 JobHawk</span>
+  <a href="/onboard" class="btn btn-ghost btn-sm">⚙ Settings</a>
+  <span class="nav-user">{{ user.name or user.email }}</span>
+  <a href="/logout" class="btn btn-ghost btn-sm">Sign out</a>
+</nav>
+{% endblock %}
+
+{% block content %}
+<div style="max-width:1320px;margin:0 auto;padding:24px 20px">
+
+  <!-- Stats row -->
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:22px">
+    <div style="background:#1a2233;border:1px solid #2d3748;border-radius:10px;padding:16px;text-align:center">
+      <div style="font-size:2rem;font-weight:800;color:#60a5fa" id="s-total">—</div>
+      <div style="font-size:.75rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-top:3px">Jobs Found</div>
+    </div>
+    <div style="background:#1a2233;border:1px solid #2d3748;border-radius:10px;padding:16px;text-align:center">
+      <div style="font-size:2rem;font-weight:800;color:#34d399" id="s-applied">—</div>
+      <div style="font-size:.75rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-top:3px">Applied</div>
+    </div>
+    <div style="background:#1a2233;border:1px solid #059669;border-radius:10px;padding:16px;text-align:center">
+      <div style="font-size:2rem;font-weight:800;color:#6ee7b7" id="s-interview">—</div>
+      <div style="font-size:.75rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-top:3px">Interviews</div>
+    </div>
+    <div style="background:#1a2233;border:1px solid #2d3748;border-radius:10px;padding:16px;text-align:center">
+      <div style="font-size:2rem;font-weight:800;color:#a78bfa" id="s-runs">—</div>
+      <div style="font-size:.75rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-top:3px">Scans Run</div>
+    </div>
+  </div>
+
+  <!-- Status bar -->
+  <div style="background:#1a2233;border:1px solid #2d3748;border-radius:10px;padding:12px 18px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+    <div style="font-size:.82rem;color:#94a3b8">
+      <span id="status-indicator" style="display:none;color:#34d399;animation:pulse 1s infinite">● Scanning… </span>
+      Last scan: <strong id="last-ran" style="color:#e2e8f0">—</strong>
+      &nbsp;·&nbsp;
+      <span id="last-status" style="color:#64748b">—</span>
+      &nbsp;·&nbsp;
+      <span id="email-status">—</span>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-primary btn-sm" onclick="runNow()">▶ Scan Now</button>
+      <button class="btn btn-ghost btn-sm" onclick="downloadCSV()">⬇ Export CSV</button>
+    </div>
+  </div>
+
+  <!-- File uploads -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:22px">
+    <div id="dz-resume" onclick="document.getElementById('inp-resume').click()"
+         ondragover="event.preventDefault();this.classList.add('dz-over')"
+         ondragleave="this.classList.remove('dz-over')"
+         ondrop="handleDrop(event,'resume')"
+         style="border:2px dashed #334155;border-radius:10px;padding:22px;text-align:center;cursor:pointer;transition:.2s">
+      <div style="font-size:1.8rem">📄</div>
+      <p id="dz-resume-lbl" style="color:#64748b;font-size:.85rem;margin-top:6px">Drop resume or click to browse</p>
+      <input type="file" id="inp-resume" style="display:none" accept=".pdf,.doc,.docx"
+             onchange="uploadFile(this.files[0],'resume')">
+    </div>
+    <div id="dz-cl" onclick="document.getElementById('inp-cl').click()"
+         ondragover="event.preventDefault();this.classList.add('dz-over')"
+         ondragleave="this.classList.remove('dz-over')"
+         ondrop="handleDrop(event,'cover_letter')"
+         style="border:2px dashed #334155;border-radius:10px;padding:22px;text-align:center;cursor:pointer;transition:.2s">
+      <div style="font-size:1.8rem">✉️</div>
+      <p id="dz-cl-lbl" style="color:#64748b;font-size:.85rem;margin-top:6px">Drop cover letter or click to browse</p>
+      <input type="file" id="inp-cl" style="display:none" accept=".pdf,.doc,.docx"
+             onchange="uploadFile(this.files[0],'cover_letter')">
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div style="display:flex;gap:4px;border-bottom:1px solid #2d3748;margin-bottom:20px">
+    <button class="tab-btn active" id="tbtn-jobs" onclick="showTab('jobs')">
+      All Jobs (<span id="cnt-jobs">0</span>)
+    </button>
+    <button class="tab-btn" id="tbtn-applied" onclick="showTab('applied')">
+      Applied (<span id="cnt-applied">0</span>)
+    </button>
+    <button class="tab-btn" id="tbtn-interviews" onclick="showTab('interviews')">
+      🎯 Interviews (<span id="cnt-interviews">0</span>)
+    </button>
+    {% if passkeys is defined %}
+    <button class="tab-btn" id="tbtn-security" onclick="showTab('security')" style="margin-left:auto">
+      🔑 Security
+    </button>
+    {% endif %}
+  </div>
+
+  <!-- All Jobs pane -->
+  <div class="pane active" id="pane-jobs">
+    <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px;align-items:center">
+      <input type="text" id="f-search" placeholder="Search title / company…"
+             oninput="applyFilters()" style="flex:1;min-width:180px;background:#1a2233;border:1px solid #334155;color:#e2e8f0;padding:8px 12px;border-radius:7px;font-size:.85rem;outline:none">
+      <select id="f-source" onchange="applyFilters()" style="background:#1a2233;border:1px solid #334155;color:#e2e8f0;padding:8px 10px;border-radius:7px;font-size:.85rem">
+        <option value="">All Sources</option>
+        <option>Remotive</option><option>Arbeitnow</option><option>RemoteOK</option>
+        <option>WeWorkRemotely</option><option>Jobicy</option><option>Indeed</option><option>LinkedIn</option>
+      </select>
+      <select id="f-remote" onchange="applyFilters()" style="background:#1a2233;border:1px solid #334155;color:#e2e8f0;padding:8px 10px;border-radius:7px;font-size:.85rem">
+        <option value="">All Locations</option>
+        <option value="remote">Remote</option>
+        <option value="canada">Canada</option>
+      </select>
+      <select id="f-score" onchange="applyFilters()" style="background:#1a2233;border:1px solid #334155;color:#e2e8f0;padding:8px 10px;border-radius:7px;font-size:.85rem">
+        <option value="0">Any Score</option>
+        <option value="30">Score ≥ 30</option>
+        <option value="50">Score ≥ 50</option>
+        <option value="70">Score ≥ 70</option>
+      </select>
+    </div>
+    <div id="jobs-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px"></div>
+    <div id="jobs-empty" style="display:none;text-align:center;padding:60px 20px;color:#475569">
+      <div style="font-size:2.5rem">🔍</div>
+      <p style="margin-top:10px">No jobs yet — click <strong>Scan Now</strong> or wait for the next automatic scan.</p>
+    </div>
+  </div>
+
+  <!-- Applied pane -->
+  <div class="pane" id="pane-applied">
+    <div id="applied-empty" style="display:none;text-align:center;padding:60px 20px;color:#475569">
+      <div style="font-size:2.5rem">📬</div>
+      <p style="margin-top:10px">No applications yet. JobHawk applies automatically when it finds a contact email in a job posting.</p>
+    </div>
+    <div style="overflow-x:auto">
+      <table id="applied-table" style="width:100%;border-collapse:collapse;font-size:.85rem">
+        <thead>
+          <tr style="border-bottom:1px solid #1e293b">
+            <th style="padding:10px 14px;text-align:left;color:#64748b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em">Job</th>
+            <th style="padding:10px 14px;text-align:left;color:#64748b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em">Company</th>
+            <th style="padding:10px 14px;text-align:left;color:#64748b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em">Source</th>
+            <th style="padding:10px 14px;text-align:left;color:#64748b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em">Applied</th>
+            <th style="padding:10px 14px;text-align:left;color:#64748b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em">Status</th>
+            <th style="padding:10px 14px;text-align:left;color:#64748b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em">Update</th>
+          </tr>
+        </thead>
+        <tbody id="applied-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Interviews pane -->
+  <div class="pane" id="pane-interviews">
+    <div id="interviews-empty" style="display:none;text-align:center;padding:60px 20px;color:#475569">
+      <div style="font-size:2.5rem">🎯</div>
+      <p style="margin-top:10px">No interviews tracked yet. Mark an applied job as "Interview" from the Applied tab to see it here.</p>
+    </div>
+    <div id="interviews-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px"></div>
+  </div>
+
+  <!-- Security pane -->
+  <div class="pane" id="pane-security">
+    <div class="card" style="max-width:540px">
+      <h3 style="font-weight:700;margin-bottom:6px">🔑 Passkeys</h3>
+      <p style="color:#64748b;font-size:.85rem;margin-bottom:18px">
+        Passkeys let you sign in without a password using your device's biometrics (Face ID, fingerprint, Windows Hello).
+      </p>
+      <div id="passkey-list" style="margin-bottom:16px">
+        {% if passkeys %}
+          {% for pk in passkeys %}
+          <div style="background:#0f1117;border:1px solid #2d3748;border-radius:8px;padding:10px 14px;margin-bottom:8px;font-size:.85rem;color:#94a3b8">
+            🔑 {{ pk.label }} · Added {{ pk.created_at[:10] }}
+          </div>
+          {% endfor %}
+        {% else %}
+          <p style="color:#475569;font-size:.85rem">No passkeys registered yet.</p>
+        {% endif %}
+      </div>
+      <button class="btn btn-primary" onclick="registerPasskey()">+ Add Passkey</button>
+      <p id="passkey-msg" style="margin-top:10px;font-size:.82rem;color:#64748b"></p>
+    </div>
+  </div>
+
+</div><!-- /container -->
+
+<!-- Toast -->
+<div id="toast" style="position:fixed;bottom:24px;right:24px;background:#1e3a5f;color:#93c5fd;border:1px solid #2563eb;padding:11px 18px;border-radius:9px;font-size:.85rem;font-weight:600;opacity:0;transition:opacity .3s;pointer-events:none;z-index:1000"></div>
+
+<style>
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.tab-btn{padding:9px 18px;border:none;background:none;color:#64748b;font-size:.88rem;font-weight:600;cursor:pointer;border-bottom:2px solid transparent;transition:all .15s}
+.tab-btn.active{color:#60a5fa;border-bottom-color:#2563eb}
+.tab-btn:hover:not(.active){color:#94a3b8}
+.pane{display:none}.pane.active{display:block}
+#dz-resume.dz-over,#dz-cl.dz-over{border-color:#3b82f6;background:#1e3a5f22}
+#dz-resume.has-file,#dz-cl.has-file{border-color:#059669;background:#064e3b22}
+tr:hover td{background:#1a2233}
+td{padding:10px 14px;border-bottom:1px solid #1e293b}
+</style>
+
+<script>
+let allJobs = [];
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+function showTab(name) {
+  document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('pane-' + name).classList.add('active');
+  const btn = document.getElementById('tbtn-' + name);
+  if (btn) btn.classList.add('active');
+  if (name === 'applied')    loadApplied();
+  if (name === 'interviews') loadInterviews();
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function toast(msg, dur=3000) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.opacity = '1';
+  setTimeout(() => t.style.opacity = '0', dur);
+}
+
+// ── Status ────────────────────────────────────────────────────────────────────
+async function loadStatus() {
+  try {
+    const d = await fetch('/api/status').then(r => r.json());
+    document.getElementById('s-total').textContent     = d.total     ?? '—';
+    document.getElementById('s-applied').textContent   = d.applied   ?? '—';
+    document.getElementById('s-interview').textContent = d.interview  ?? '—';
+    document.getElementById('s-runs').textContent      = d.run_count  ?? '—';
+    document.getElementById('last-ran').textContent    = d.last_ran   || 'Never';
+    document.getElementById('last-status').textContent = d.last_status || '—';
+    document.getElementById('cnt-applied').textContent    = d.applied   ?? 0;
+    document.getElementById('cnt-interviews').textContent = d.interview  ?? 0;
+    document.getElementById('email-status').textContent  =
+      d.email_configured ? '📧 Email configured' : '⚠ No email — set up in Settings';
+    document.getElementById('status-indicator').style.display = d.running ? 'inline' : 'none';
+    if (d.resume_name) {
+      document.getElementById('dz-resume').classList.add('has-file');
+      document.getElementById('dz-resume-lbl').textContent = '✅ ' + d.resume_name;
+    }
+    if (d.cover_letter_name) {
+      document.getElementById('dz-cl').classList.add('has-file');
+      document.getElementById('dz-cl-lbl').textContent = '✅ ' + d.cover_letter_name;
+    }
+  } catch(e) { console.error('status', e); }
+}
+
+// ── Jobs ──────────────────────────────────────────────────────────────────────
+async function loadJobs() {
+  try {
+    allJobs = await fetch('/api/jobs').then(r => r.json());
+    document.getElementById('cnt-jobs').textContent = allJobs.length;
+    applyFilters();
+  } catch(e) { console.error('jobs', e); }
+}
+
+function applyFilters() {
+  const q      = (document.getElementById('f-search').value || '').toLowerCase();
+  const src    = (document.getElementById('f-source').value || '').toLowerCase();
+  const remote = document.getElementById('f-remote').value;
+  const minSc  = parseInt(document.getElementById('f-score').value || '0');
+  const f = allJobs.filter(j => {
+    const blob = ((j.title||'') + ' ' + (j.company||'')).toLowerCase();
+    if (q && !blob.includes(q)) return false;
+    if (src && (j.source||'').toLowerCase() !== src) return false;
+    if (remote === 'remote' && !['true','1'].includes(String(j.remote))) return false;
+    if (remote === 'canada') {
+      const loc = (j.location||'').toLowerCase();
+      if (!loc.includes('canada') && !loc.includes('alberta') && !loc.includes('calgary')) return false;
+    }
+    if ((parseInt(j.match_score)||0) < minSc) return false;
+    return true;
+  });
+  renderJobGrid(f);
+}
+
+function scoreStyle(n) {
+  if (n >= 50) return 'background:#064e3b;color:#34d399';
+  if (n >= 25) return 'background:#451a03;color:#fbbf24';
+  return 'background:#1e293b;color:#64748b';
+}
+
+function renderJobGrid(jobs) {
+  const grid  = document.getElementById('jobs-grid');
+  const empty = document.getElementById('jobs-empty');
+  if (!jobs.length) { grid.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  grid.innerHTML = jobs.map(j => {
+    const sc = parseInt(j.match_score) || 0;
+    const remote = ['true','1'].includes(String(j.remote));
+    return `<div style="background:#1a2233;border:1px solid #2d3748;border-radius:11px;padding:16px;display:flex;flex-direction:column;gap:9px;transition:border-color .15s" onmouseover="this.style.borderColor='#3b82f6'" onmouseout="this.style.borderColor='#2d3748'">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+        <div>
+          <div style="font-weight:700;font-size:.92rem;color:#e2e8f0;line-height:1.3">${j.title||'Unknown'}</div>
+          <div style="color:#60a5fa;font-size:.8rem;margin-top:3px;font-weight:600">${j.company||'—'}</div>
+        </div>
+        <span style="font-size:.75rem;font-weight:700;padding:3px 8px;border-radius:6px;white-space:nowrap;${scoreStyle(sc)}">${sc}</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:5px">
+        <span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#1e3a5f;color:#93c5fd">${j.source||'?'}</span>
+        ${remote ? '<span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#064e3b;color:#6ee7b7">Remote</span>' : ''}
+        ${j.location ? `<span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#1e293b;color:#94a3b8">${j.location}</span>` : ''}
+        ${j.email_found ? '<span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#451a03;color:#fcd34d">📧 Has email</span>' : ''}
+      </div>
+      ${j.url ? `<a href="${j.url}" target="_blank" rel="noopener" style="font-size:.78rem;color:#60a5fa">🔗 View Job</a>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// ── Applied ───────────────────────────────────────────────────────────────────
+async function loadApplied() {
+  const jobs = await fetch('/api/applied').then(r => r.json());
+  const tbody = document.getElementById('applied-tbody');
+  const empty = document.getElementById('applied-empty');
+  const tbl   = document.getElementById('applied-table');
+  if (!jobs.length) { empty.style.display='block'; tbl.style.display='none'; return; }
+  empty.style.display='none'; tbl.style.display='';
+  const colors = {applied:'#1e3a5f;color:#93c5fd',interview:'#064e3b;color:#6ee7b7',
+                  offer:'#3b0764;color:#d8b4fe',rejected:'#2d1515;color:#f87171',new:'#1e293b;color:#94a3b8'};
+  tbody.innerHTML = jobs.map(j => {
+    const s = j.status || 'applied';
+    const c = colors[s] || colors.new;
+    return `<tr>
+      <td><a href="${j.url||'#'}" target="_blank">${j.title||'—'}</a></td>
+      <td style="color:#94a3b8">${j.company||'—'}</td>
+      <td><span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#1e3a5f;color:#93c5fd">${j.source||'—'}</span></td>
+      <td style="color:#64748b;font-size:.78rem">${(j.applied_at||'').split('.')[0]}</td>
+      <td><span style="font-size:.72rem;padding:3px 9px;border-radius:5px;font-weight:600;display:inline-block;background:${c}">${s}</span></td>
+      <td>
+        <select onchange="setStatus('${j.id}',this.value)" style="background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:4px 8px;border-radius:6px;font-size:.75rem">
+          <option value="" disabled selected>Update…</option>
+          <option value="applied">Applied</option>
+          <option value="interview">Interview 🎯</option>
+          <option value="offer">Offer ✅</option>
+          <option value="rejected">Rejected</option>
+        </select>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Interviews ────────────────────────────────────────────────────────────────
+async function loadInterviews() {
+  const jobs  = await fetch('/api/interviews').then(r => r.json());
+  const grid  = document.getElementById('interviews-grid');
+  const empty = document.getElementById('interviews-empty');
+  if (!jobs.length) { grid.innerHTML=''; empty.style.display='block'; return; }
+  empty.style.display='none';
+  grid.innerHTML = jobs.map(j => `
+    <div style="background:#1a2233;border:1px solid #059669;border-radius:11px;padding:18px;display:flex;flex-direction:column;gap:10px">
+      <div style="color:#34d399;font-weight:700;font-size:.95rem">🎯 ${j.title||'—'}</div>
+      <div style="color:#60a5fa;font-size:.82rem;font-weight:600">${j.company||'—'}</div>
+      <div style="display:flex;gap:5px">
+        <span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#064e3b;color:#6ee7b7">Interview</span>
+        <span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#1e3a5f;color:#93c5fd">${j.source||'—'}</span>
+      </div>
+      ${j.url ? `<a href="${j.url}" target="_blank" style="font-size:.8rem">🔗 View Job</a>` : ''}
+      <select onchange="setStatus('${j.id}',this.value)" style="background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:6px 10px;border-radius:6px;font-size:.8rem;width:100%">
+        <option value="" disabled selected>Update status…</option>
+        <option value="interview">Interview</option>
+        <option value="offer">Offer ✅</option>
+        <option value="rejected">Rejected</option>
+      </select>
+    </div>`).join('');
+}
+
+// ── Actions ───────────────────────────────────────────────────────────────────
+async function setStatus(id, status) {
+  if (!status) return;
+  await fetch('/api/job/status', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id, status})
+  });
+  toast('Marked as ' + status);
+  loadStatus(); loadApplied(); loadInterviews();
+}
+
+async function runNow() {
+  toast('Starting scan…');
+  await fetch('/api/run', {method:'POST'});
+  setTimeout(() => { loadStatus(); loadJobs(); }, 4000);
+}
+
+function downloadCSV() { window.location = '/api/download'; }
+
+function handleDrop(ev, type) {
+  ev.preventDefault();
+  ev.currentTarget.classList.remove('dz-over');
+  const file = ev.dataTransfer.files[0];
+  if (file) uploadFile(file, type);
+}
+
+async function uploadFile(file, type) {
+  if (!file) return;
+  toast('Uploading ' + file.name + '…');
+  const fd = new FormData();
+  fd.append('file', file); fd.append('type', type);
+  const d = await fetch('/api/upload', {method:'POST', body:fd}).then(r => r.json());
+  if (d.ok) {
+    const dzId  = type === 'resume' ? 'dz-resume' : 'dz-cl';
+    const lblId = type === 'resume' ? 'dz-resume-lbl' : 'dz-cl-lbl';
+    document.getElementById(dzId).classList.add('has-file');
+    const extra = (d.skills_found > 0) ? ` — ${d.skills_found} skills found` : '';
+    document.getElementById(lblId).textContent = '✅ ' + file.name + extra;
+    toast('✅ ' + file.name + ' uploaded' + extra);
+    loadStatus();
+  } else {
+    toast('Upload failed');
+  }
+}
+
+// ── Passkeys ──────────────────────────────────────────────────────────────────
+async function b64ToBuffer(b64) {
+  const bin = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
+  return Uint8Array.from(bin, c => c.charCodeAt(0));
+}
+function bufToB64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+
+async function registerPasskey() {
+  if (!window.PublicKeyCredential) {
+    document.getElementById('passkey-msg').textContent = 'This browser does not support passkeys.';
+    return;
+  }
+  try {
+    const r1   = await fetch('/auth/passkey/register/begin', {method:'POST'});
+    const opts = await r1.json();
+    if (opts.error) { document.getElementById('passkey-msg').textContent = 'Error: ' + opts.error; return; }
+    opts.challenge    = await b64ToBuffer(opts.challenge);
+    opts.user.id      = await b64ToBuffer(opts.user.id);
+    if (opts.excludeCredentials) {
+      opts.excludeCredentials = await Promise.all(
+        opts.excludeCredentials.map(async c => ({...c, id: await b64ToBuffer(c.id)}))
+      );
+    }
+    const cred = await navigator.credentials.create({publicKey: opts});
+    const payload = {
+      id: cred.id, rawId: bufToB64(cred.rawId), type: cred.type,
+      response: {
+        clientDataJSON:    bufToB64(cred.response.clientDataJSON),
+        attestationObject: bufToB64(cred.response.attestationObject),
+      }
+    };
+    const r2 = await fetch('/auth/passkey/register/complete', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)
+    });
+    const d = await r2.json();
+    if (d.ok) {
+      document.getElementById('passkey-msg').textContent = '✅ Passkey added! You can now sign in without a password.';
+      toast('✅ Passkey registered');
+    } else {
+      document.getElementById('passkey-msg').textContent = 'Failed: ' + (d.error||'unknown');
+    }
+  } catch(e) {
+    if (e.name !== 'NotAllowedError')
+      document.getElementById('passkey-msg').textContent = 'Error: ' + e.message;
+  }
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+loadStatus();
+loadJobs();
+setInterval(loadStatus, 15000);
+setInterval(loadJobs,   60000);
+</script>
+{% endblock %}

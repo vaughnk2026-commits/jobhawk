@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Set Up Your Profile — JobHawk{% endblock %}
+{% block content %}
+<div style="min-height:100vh;padding:40px 20px">
+  <div style="max-width:640px;margin:0 auto">
+    <div style="text-align:center;margin-bottom:32px">
+      <h1 style="font-size:1.6rem;font-weight:800;color:#60a5fa">🦅 Set Up Your Profile</h1>
+      <p style="color:#64748b;margin-top:8px">
+        Tell JobHawk what you're looking for. This takes 2 minutes and runs on autopilot after.
+      </p>
+    </div>
+
+    <form method="POST" action="/onboard">
+
+      <!-- Step 1: Target roles -->
+      <div class="card" style="margin-bottom:20px">
+        <h3 style="font-weight:700;margin-bottom:4px">1. What roles are you targeting?</h3>
+        <p style="color:#64748b;font-size:.85rem;margin-bottom:14px">
+          One per line or comma-separated. JobHawk searches for these specifically.
+        </p>
+        <textarea class="form-input" name="target_roles" rows="4"
+          placeholder="Sales Manager&#10;Business Development Manager&#10;Account Executive"
+          style="resize:vertical">{{ (profile.target_roles or []) | join('\n') }}</textarea>
+      </div>
+
+      <!-- Step 2: Location -->
+      <div class="card" style="margin-bottom:20px">
+        <h3 style="font-weight:700;margin-bottom:4px">2. Where are you based / looking?</h3>
+        <p style="color:#64748b;font-size:.85rem;margin-bottom:14px">
+          City, province, or "Remote" — used to weight local and remote results.
+        </p>
+        <input class="form-input" type="text" name="location"
+          placeholder="Calgary, Alberta, Canada"
+          value="{{ profile.location or '' }}">
+      </div>
+
+      <!-- Step 3: Keywords -->
+      <div class="card" style="margin-bottom:20px">
+        <h3 style="font-weight:700;margin-bottom:4px">3. Additional keywords (optional)</h3>
+        <p style="color:#64748b;font-size:.85rem;margin-bottom:14px">
+          Skills, industry terms, or tools that should boost a job's match score.
+        </p>
+        <textarea class="form-input" name="keywords" rows="3"
+          placeholder="CRM, SaaS, automotive, B2B, revenue growth"
+          style="resize:vertical">{{ (profile.keywords or []) | join(', ') }}</textarea>
+      </div>
+
+      <!-- Step 4: Exclude terms -->
+      <div class="card" style="margin-bottom:20px">
+        <h3 style="font-weight:700;margin-bottom:4px">4. Terms to exclude (optional)</h3>
+        <p style="color:#64748b;font-size:.85rem;margin-bottom:14px">
+          Jobs containing these words will be skipped.
+        </p>
+        <textarea class="form-input" name="exclude_terms" rows="2"
+          placeholder="entry level, unpaid, internship"
+          style="resize:vertical">{{ (profile.exclude_terms or []) | join(', ') }}</textarea>
+      </div>
+
+      <!-- Step 5: Email credentials -->
+      <div class="card" style="margin-bottom:20px">
+        <h3 style="font-weight:700;margin-bottom:4px">5. Your email for sending applications</h3>
+        <p style="color:#64748b;font-size:.85rem;margin-bottom:14px">
+          JobHawk sends applications from your email. For Gmail, use an
+          <a href="https://myaccount.google.com/apppasswords" target="_blank">App Password</a>
+          (not your regular password). Leave blank to skip auto-email applications.
+        </p>
+        <div class="form-group">
+          <label>Your email address</label>
+          <input class="form-input" type="email" name="email_from"
+            placeholder="you@gmail.com" value="{{ profile.email_from or '' }}">
+        </div>
+        <div class="form-group">
+          <label>App password <span style="color:#475569;font-weight:400">(stored on server, used only to send applications)</span></label>
+          <input class="form-input" type="password" name="email_password"
+            placeholder="xxxx xxxx xxxx xxxx"
+            value="{{ profile.email_password or '' }}">
+        </div>
+        <details style="margin-top:8px">
+          <summary style="font-size:.82rem;color:#64748b;cursor:pointer">Advanced SMTP settings</summary>
+          <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="form-group" style="margin-bottom:0">
+              <label>SMTP host</label>
+              <input class="form-input" type="text" name="smtp_host"
+                value="{{ profile.smtp_host or 'smtp.gmail.com' }}">
+            </div>
+            <div class="form-group" style="margin-bottom:0">
+              <label>SMTP port</label>
+              <input class="form-input" type="number" name="smtp_port"
+                value="{{ profile.smtp_port or 587 }}">
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- Min score -->
+      <div class="card" style="margin-bottom:24px">
+        <h3 style="font-weight:700;margin-bottom:4px">6. Minimum match score to apply</h3>
+        <p style="color:#64748b;font-size:.85rem;margin-bottom:14px">
+          Jobs below this score are tracked but not applied to automatically.
+          Lower = more applications. Recommended: 10–20.
+        </p>
+        <div style="display:flex;align-items:center;gap:12px">
+          <input type="range" name="min_score" min="0" max="60" step="5"
+            value="{{ profile.min_score or 10 }}"
+            id="score-range" oninput="document.getElementById('score-val').textContent=this.value"
+            style="flex:1">
+          <span id="score-val" style="font-size:1.2rem;font-weight:700;color:#60a5fa;min-width:32px">
+            {{ profile.min_score or 10 }}
+          </span>
+        </div>
+      </div>
+
+      <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center;padding:14px">
+        Save Profile &amp; Go to Dashboard →
+      </button>
+
+      <p style="text-align:center;margin-top:14px;font-size:.82rem;color:#475569">
+        You can change any of this later from your dashboard settings.
+      </p>
+    </form>
+  </div>
+</div>
+{% endblock %}

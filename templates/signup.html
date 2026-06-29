@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Create Account — JobHawk{% endblock %}
+{% block content %}
+<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px">
+  <div style="width:100%;max-width:440px">
+    <div style="text-align:center;margin-bottom:32px">
+      <div style="font-size:2.5rem;margin-bottom:8px">🦅</div>
+      <h1 style="font-size:1.8rem;font-weight:800;color:#60a5fa">JobHawk</h1>
+      <p style="color:#64748b;margin-top:6px">Your automated job search co-pilot</p>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:1.1rem;font-weight:700;margin-bottom:6px">Create your free account</h2>
+      <p style="color:#64748b;font-size:.85rem;margin-bottom:20px">
+        Upload your resume once. JobHawk finds and applies to matching jobs 24/7.
+      </p>
+
+      {% if error %}
+      <div class="error-msg">{{ error }}</div>
+      {% endif %}
+
+      <form method="POST" action="/signup">
+        <div class="form-group">
+          <label>Full name</label>
+          <input class="form-input" type="text" name="name" placeholder="Jane Smith" required autofocus>
+        </div>
+        <div class="form-group">
+          <label>Email address</label>
+          <input class="form-input" type="email" name="email" placeholder="jane@example.com" required>
+        </div>
+        <div class="form-group">
+          <label>Password <span style="color:#475569;font-weight:400">(min 8 characters)</span></label>
+          <input class="form-input" type="password" name="password" placeholder="••••••••" minlength="8" required>
+        </div>
+
+        <div style="background:#1e293b;border-radius:8px;padding:12px;margin-bottom:16px;font-size:.8rem;color:#64748b">
+          By creating an account you agree that JobHawk will submit job applications
+          on your behalf using your uploaded resume and credentials.
+        </div>
+
+        <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center">
+          Create Account &rarr;
+        </button>
+      </form>
+
+      <p style="text-align:center;margin-top:20px;font-size:.85rem;color:#64748b">
+        Already have an account? <a href="/login">Sign in</a>
+      </p>
+    </div>
+
+    <div style="margin-top:24px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;text-align:center">
+      <div style="background:#1a2233;border-radius:10px;padding:16px">
+        <div style="font-size:1.5rem">🔍</div>
+        <div style="font-size:.75rem;color:#64748b;margin-top:4px">7 job boards</div>
+      </div>
+      <div style="background:#1a2233;border-radius:10px;padding:16px">
+        <div style="font-size:1.5rem">⚡</div>
+        <div style="font-size:.75rem;color:#64748b;margin-top:4px">Every 15 min</div>
+      </div>
+      <div style="background:#1a2233;border-radius:10px;padding:16px">
+        <div style="font-size:1.5rem">📬</div>
+        <div style="font-size:.75rem;color:#64748b;margin-top:4px">Email updates</div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

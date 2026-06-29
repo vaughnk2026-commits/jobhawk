@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{% block title %}JobHawk{% endblock %}</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
+a{color:#60a5fa;text-decoration:none}a:hover{text-decoration:underline}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:10px 20px;border-radius:8px;border:none;font-size:.875rem;font-weight:600;cursor:pointer;transition:all .15s;text-decoration:none}
+.btn-primary{background:#2563eb;color:#fff}.btn-primary:hover{background:#1d4ed8;text-decoration:none}
+.btn-secondary{background:#1e293b;color:#94a3b8;border:1px solid #334155}.btn-secondary:hover{background:#273549;color:#e2e8f0;text-decoration:none}
+.btn-ghost{background:transparent;color:#64748b;border:1px solid #334155}.btn-ghost:hover{background:#1e293b;color:#e2e8f0;text-decoration:none}
+.btn-sm{padding:6px 14px;font-size:.8rem}
+.btn-danger{background:#dc2626;color:#fff}.btn-danger:hover{background:#b91c1c}
+.card{background:#1a2233;border:1px solid #2d3748;border-radius:12px;padding:24px}
+.form-group{margin-bottom:16px}
+.form-group label{display:block;font-size:.85rem;font-weight:600;color:#94a3b8;margin-bottom:6px}
+.form-input{width:100%;background:#0f1117;border:1px solid #334155;color:#e2e8f0;padding:10px 14px;border-radius:8px;font-size:.9rem;outline:none;transition:border-color .15s}
+.form-input:focus{border-color:#3b82f6}
+.form-input::placeholder{color:#475569}
+.error-msg{background:#2d1515;border:1px solid #dc2626;color:#f87171;padding:10px 14px;border-radius:8px;font-size:.85rem;margin-bottom:16px}
+.success-msg{background:#064e3b;border:1px solid #059669;color:#6ee7b7;padding:10px 14px;border-radius:8px;font-size:.85rem;margin-bottom:16px}
+nav{background:#111827;border-bottom:1px solid #1f2937;padding:12px 24px;display:flex;align-items:center;gap:16px}
+nav .logo{font-size:1.2rem;font-weight:800;color:#60a5fa;margin-right:auto}
+nav .nav-user{font-size:.82rem;color:#64748b}
+</style>
+{% block head %}{% endblock %}
+</head>
+<body>
+{% block nav %}{% endblock %}
+{% block content %}{% endblock %}
+</body>
+</html>
