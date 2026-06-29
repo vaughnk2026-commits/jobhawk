@@ -1,7 +1,6 @@
 """
-JobHawk Web — Vaughn Krogman Job Search Dashboard
-Run with: python app.py
-Then open: http://localhost:5000
+JobHawk Web — Vaughn Krogman Automated Job Search
+Scrapes 7 sources every 15 minutes. Auto-applies via email. SQLite tracking.
 """
 
 import concurrent.futures
@@ -11,29 +10,37 @@ import json
 import logging
 import os
 import re
+import smtplib
+import sqlite3
 import threading
 import xml.etree.ElementTree as ET
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
 import requests
 import yaml
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template_string, request, send_file
+from flask import Flask, jsonify, render_template, request, send_file
 from apscheduler.schedulers.background import BackgroundScheduler
 
 load_dotenv()
 
-BASE = Path(__file__).resolve().parent
-DATA = BASE / "data"
-OUTPUT = BASE / "output"
-LOGS = BASE / "logs"
+BASE    = Path(__file__).resolve().parent
+DATA    = BASE / "data"
+OUTPUT  = BASE / "output"
+LOGS    = BASE / "logs"
 PACKETS = OUTPUT / "application_packets"
 UPLOADS = BASE / "uploads"
+DB_PATH = DATA / "jobhawk.db"
 
-for folder in [DATA, OUTPUT, LOGS, PACKETS, UPLOADS]:
-    folder.mkdir(parents=True, exist_ok=True)
+for _d in [DATA, OUTPUT, LOGS, PACKETS, UPLOADS]:
+    _d.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     filename=LOGS / "jobhawk.log",
@@ -43,32 +50,142 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
-# ── shared state ──────────────────────────────────────────────────────────────
+
+# ── SQLite ────────────────────────────────────────────────────────────────────
+
+_db_lock = threading.Lock()
+
+def _db():
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with _db() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id          TEXT PRIMARY KEY,
+                title       TEXT,
+                company     TEXT,
+                location    TEXT,
+                url         TEXT,
+                source      TEXT,
+                match_score INTEGER DEFAULT 0,
+                status      TEXT    DEFAULT 'new',
+                email_found TEXT,
+                applied_at  TEXT,
+                notes       TEXT,
+                first_seen  TEXT    DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        c.commit()
+
+init_db()
+
+def db_upsert(job: Dict):
+    jid = job.get("url") or f"{job.get('company','')}|{job.get('title','')}"
+    with _db_lock:
+        with _db() as c:
+            c.execute("""
+                INSERT OR IGNORE INTO jobs
+                  (id, title, company, location, url, source, match_score, email_found)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (jid, job.get("title"), job.get("company"), job.get("location"),
+                  job.get("url"), job.get("source"), job.get("match_score", 0),
+                  job.get("email_found")))
+            c.execute("UPDATE jobs SET match_score=? WHERE id=? AND status='new'",
+                      (job.get("match_score", 0), jid))
+            c.commit()
+    return jid
+
+def db_mark_applied(jid: str, email_found: Optional[str] = None):
+    with _db_lock:
+        with _db() as c:
+            c.execute("""
+                UPDATE jobs SET status='applied', applied_at=CURRENT_TIMESTAMP,
+                               email_found=COALESCE(?,email_found)
+                WHERE id=? AND status='new'
+            """, (email_found, jid))
+            c.commit()
+
+def db_update_status(jid: str, status: str, notes: str = ""):
+    with _db_lock:
+        with _db() as c:
+            c.execute("UPDATE jobs SET status=?, notes=? WHERE id=?", (status, notes, jid))
+            c.commit()
+
+def db_applied() -> List[Dict]:
+    with _db() as c:
+        rows = c.execute("""
+            SELECT * FROM jobs
+            WHERE status IN ('applied','interview','offer','rejected')
+            ORDER BY applied_at DESC
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+def db_interviews() -> List[Dict]:
+    with _db() as c:
+        rows = c.execute(
+            "SELECT * FROM jobs WHERE status='interview' ORDER BY applied_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def db_stats() -> Dict:
+    with _db() as c:
+        total     = c.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        applied   = c.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('applied','interview','offer','rejected')").fetchone()[0]
+        interview = c.execute("SELECT COUNT(*) FROM jobs WHERE status='interview'").fetchone()[0]
+    return {"total": total, "applied": applied, "interview": interview}
+
+
+# ── State ─────────────────────────────────────────────────────────────────────
+
 _state: Dict[str, Any] = {
     "last_run": None,
     "last_run_status": "Never run",
     "running": False,
     "job_count": 0,
-    "packet_count": 0,
+    "applied_count": 0,
+    "interview_count": 0,
     "run_count": 0,
     "resume_name": None,
+    "resume_path": None,
     "cover_letter_name": None,
+    "cover_letter_path": None,
 }
 _state_lock = threading.Lock()
 
+_paths_file = DATA / "paths.json"
+if _paths_file.exists():
+    try:
+        _state.update(json.loads(_paths_file.read_text()))
+    except Exception:
+        pass
 
-# ── job fetchers ──────────────────────────────────────────────────────────────
 
-def normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "")).strip()
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
+def normalize(t: str) -> str:
+    return re.sub(r"\s+", " ", (t or "")).strip()
 
 def load_config() -> Dict[str, Any]:
     with open(BASE / "config.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
+EMAIL_RE = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
+SKIP_DOMAINS = {"example.com", "noreply.com", "sentry.io", "email.com", "test.com"}
+
+def find_email(text: str) -> Optional[str]:
+    for m in EMAIL_RE.findall(text or ""):
+        dom = m.split("@")[-1].lower()
+        if dom not in SKIP_DOMAINS and "noreply" not in m.lower():
+            return m
+    return None
+
+
+# ── Fetchers ──────────────────────────────────────────────────────────────────
 
 def fetch_remotive() -> List[Dict]:
     jobs = []
@@ -87,7 +204,7 @@ def fetch_remotive() -> List[Dict]:
                 "description": BeautifulSoup(item.get("description") or "", "html.parser").get_text(" "),
             })
     except Exception as e:
-        log.exception("Remotive fetch failed: %s", e)
+        log.exception("Remotive: %s", e)
     return jobs
 
 
@@ -100,33 +217,28 @@ def fetch_arbeitnow() -> List[Dict]:
             loc = normalize(item.get("location"))
             is_remote = bool(item.get("remote")) or "remote" in loc.lower()
             desc = BeautifulSoup(item.get("description") or "", "html.parser").get_text(" ")
-            text = f"{item.get('title','')} {item.get('company_name','')} {loc} {desc}".lower()
-            if is_remote or "canada" in text or "calgary" in text or "alberta" in text:
-                jobs.append({
-                    "source": "Arbeitnow",
-                    "title": normalize(item.get("title")),
-                    "company": normalize(item.get("company_name")),
-                    "location": loc or "Remote/Various",
-                    "remote": is_remote,
-                    "url": item.get("url"),
-                    "date_posted": str(item.get("created_at") or ""),
-                    "description": desc,
-                })
+            jobs.append({
+                "source": "Arbeitnow",
+                "title": normalize(item.get("title")),
+                "company": normalize(item.get("company_name")),
+                "location": loc or "Remote",
+                "remote": is_remote,
+                "url": item.get("url"),
+                "date_posted": str(item.get("created_at") or ""),
+                "description": desc,
+            })
     except Exception as e:
-        log.exception("Arbeitnow fetch failed: %s", e)
+        log.exception("Arbeitnow: %s", e)
     return jobs
 
 
 def fetch_remoteok() -> List[Dict]:
     jobs = []
     try:
-        r = requests.get(
-            "https://remoteok.io/api", timeout=25,
-            headers={"User-Agent": "JobHawk/1.0 (job search bot)"}
-        )
+        r = requests.get("https://remoteok.io/api", timeout=25,
+                         headers={"User-Agent": "JobHawk/1.0 (job search bot)"})
         r.raise_for_status()
         data = r.json()
-        # First element is legal/metadata notice — skip it
         for item in (data[1:] if len(data) > 1 else []):
             if not isinstance(item, dict) or not item.get("position"):
                 continue
@@ -143,52 +255,44 @@ def fetch_remoteok() -> List[Dict]:
                 "description": f"{desc} {tags}",
             })
     except Exception as e:
-        log.exception("RemoteOK fetch failed: %s", e)
+        log.exception("RemoteOK: %s", e)
     return jobs
 
 
 def fetch_weworkremotely() -> List[Dict]:
     jobs = []
     try:
-        r = requests.get(
-            "https://weworkremotely.com/remote-jobs.rss", timeout=25,
-            headers={"User-Agent": "JobHawk/1.0"}
-        )
+        r = requests.get("https://weworkremotely.com/remote-jobs.rss", timeout=25,
+                         headers={"User-Agent": "JobHawk/1.0"})
         r.raise_for_status()
         root = ET.fromstring(r.content)
         for item in root.findall(".//item"):
             def txt(tag):
                 el = item.find(tag)
                 return (el.text or "") if el is not None else ""
-            raw_title = txt("title")
-            # WWR format: "Company: Job Title"
-            parts = raw_title.split(":", 1)
+            raw = txt("title")
+            parts = raw.split(":", 1)
             company = normalize(parts[0]) if len(parts) > 1 else ""
-            title = normalize(parts[1]) if len(parts) > 1 else normalize(raw_title)
+            title   = normalize(parts[1]) if len(parts) > 1 else normalize(raw)
             desc = BeautifulSoup(txt("description"), "html.parser").get_text(" ")
-            url = txt("link") or txt("guid")
             jobs.append({
                 "source": "WeWorkRemotely",
-                "title": title,
-                "company": company,
-                "location": "Remote",
-                "remote": True,
-                "url": url,
+                "title": title, "company": company,
+                "location": "Remote", "remote": True,
+                "url": txt("link") or txt("guid"),
                 "date_posted": normalize(txt("pubDate")),
                 "description": desc,
             })
     except Exception as e:
-        log.exception("WeWorkRemotely fetch failed: %s", e)
+        log.exception("WeWorkRemotely: %s", e)
     return jobs
 
 
 def fetch_jobicy() -> List[Dict]:
     jobs = []
     try:
-        r = requests.get(
-            "https://jobicy.com/?feed=job_feed", timeout=25,
-            headers={"User-Agent": "JobHawk/1.0"}
-        )
+        r = requests.get("https://jobicy.com/?feed=job_feed", timeout=25,
+                         headers={"User-Agent": "JobHawk/1.0"})
         r.raise_for_status()
         root = ET.fromstring(r.content)
         for item in root.findall(".//item"):
@@ -196,210 +300,287 @@ def fetch_jobicy() -> List[Dict]:
                 el = item.find(tag)
                 return (el.text or "") if el is not None else ""
             title = normalize(txt("title"))
-            url = txt("link") or txt("guid")
-            desc = BeautifulSoup(txt("description"), "html.parser").get_text(" ")
-            pub = normalize(txt("pubDate"))
-            # Try namespaced company tag
+            url   = txt("link") or txt("guid")
+            desc  = BeautifulSoup(txt("description"), "html.parser").get_text(" ")
             company = ""
             for child in item:
                 if "company" in child.tag.lower():
-                    company = normalize(child.text or "")
-                    break
-            # Fall back: "Title @ Company" pattern
+                    company = normalize(child.text or ""); break
             if not company and " @ " in title:
                 parts = title.split(" @ ", 1)
                 title, company = normalize(parts[0]), normalize(parts[1])
             jobs.append({
                 "source": "Jobicy",
-                "title": title,
-                "company": company or "—",
-                "location": "Remote",
-                "remote": True,
-                "url": url,
-                "date_posted": pub,
+                "title": title, "company": company or "—",
+                "location": "Remote", "remote": True,
+                "url": url, "date_posted": normalize(txt("pubDate")),
                 "description": desc,
             })
     except Exception as e:
-        log.exception("Jobicy fetch failed: %s", e)
+        log.exception("Jobicy: %s", e)
+    return jobs
+
+
+def fetch_indeed() -> List[Dict]:
+    jobs = []
+    try:
+        cfg = load_config()
+        queries = cfg.get("sources", {}).get("indeed_queries", [
+            "automotive finance manager Canada",
+            "sales manager Calgary Alberta",
+            "business development manager Alberta",
+        ])
+        hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        for q in queries:
+            try:
+                params = urlencode({"q": q, "l": "Calgary, Alberta", "sort": "date", "radius": "100"})
+                r = requests.get(f"https://www.indeed.com/rss?{params}", timeout=20, headers=hdrs)
+                if r.status_code != 200:
+                    continue
+                root = ET.fromstring(r.content)
+                for item in root.findall(".//item"):
+                    def txt(tag):
+                        el = item.find(tag)
+                        return (el.text or "") if el is not None else ""
+                    title = normalize(txt("title"))
+                    src_el = item.find("source")
+                    company = normalize(src_el.text if src_el is not None and src_el.text else "")
+                    desc = BeautifulSoup(txt("description"), "html.parser").get_text(" ")
+                    jobs.append({
+                        "source": "Indeed",
+                        "title": title, "company": company or "—",
+                        "location": normalize(txt("location") or "Calgary, Alberta"),
+                        "remote": "remote" in title.lower() or "remote" in desc.lower(),
+                        "url": txt("link"),
+                        "date_posted": normalize(txt("pubDate")),
+                        "description": desc,
+                    })
+            except Exception as eq:
+                log.warning("Indeed query '%s': %s", q, eq)
+    except Exception as e:
+        log.exception("Indeed: %s", e)
+    return jobs
+
+
+def fetch_linkedin() -> List[Dict]:
+    jobs = []
+    try:
+        cfg = load_config()
+        searches = cfg.get("sources", {}).get("linkedin_searches", [
+            {"keywords": "automotive finance manager", "location": "Calgary, Alberta, Canada"},
+            {"keywords": "sales manager", "location": "Alberta, Canada"},
+        ])
+        hdrs = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        for s in searches:
+            try:
+                params = {"keywords": s["keywords"], "location": s["location"],
+                          "f_TPR": "r86400", "start": 0}
+                r = requests.get(
+                    "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search",
+                    params=params, timeout=20, headers=hdrs
+                )
+                if r.status_code != 200:
+                    continue
+                soup = BeautifulSoup(r.text, "html.parser")
+                for card in soup.find_all("li"):
+                    title_el = card.find("h3")
+                    company_el = card.find("h4")
+                    loc_el = card.find("span", class_=lambda c: c and "location" in (c or ""))
+                    link_el = card.find("a", href=True)
+                    if not title_el or not title_el.get_text(strip=True):
+                        continue
+                    url = link_el["href"].split("?")[0] if link_el else ""
+                    jobs.append({
+                        "source": "LinkedIn",
+                        "title": normalize(title_el.get_text()),
+                        "company": normalize(company_el.get_text()) if company_el else "—",
+                        "location": normalize(loc_el.get_text()) if loc_el else s["location"],
+                        "remote": "remote" in normalize(title_el.get_text()).lower(),
+                        "url": url,
+                        "date_posted": "",
+                        "description": normalize(card.get_text()),
+                    })
+            except Exception as es:
+                log.warning("LinkedIn '%s': %s", s["keywords"], es)
+    except Exception as e:
+        log.exception("LinkedIn: %s", e)
     return jobs
 
 
 def search_jobs(cfg) -> List[Dict]:
-    """Run all enabled sources in parallel for maximum speed."""
-    source_cfg = cfg.get("sources", {})
-
+    sc = cfg.get("sources", {})
     fetcher_map = {
-        "remotive": (fetch_remotive, source_cfg.get("remotive", True)),
-        "arbeitnow": (fetch_arbeitnow, source_cfg.get("arbeitnow", True)),
-        "remoteok": (fetch_remoteok, source_cfg.get("remoteok", True)),
-        "weworkremotely": (fetch_weworkremotely, source_cfg.get("weworkremotely", True)),
-        "jobicy": (fetch_jobicy, source_cfg.get("jobicy", True)),
+        "remotive":       (fetch_remotive,      sc.get("remotive", True)),
+        "arbeitnow":      (fetch_arbeitnow,      sc.get("arbeitnow", True)),
+        "remoteok":       (fetch_remoteok,       sc.get("remoteok", True)),
+        "weworkremotely": (fetch_weworkremotely, sc.get("weworkremotely", True)),
+        "jobicy":         (fetch_jobicy,         sc.get("jobicy", True)),
+        "indeed":         (fetch_indeed,         sc.get("indeed", True)),
+        "linkedin":       (fetch_linkedin,       sc.get("linkedin", True)),
     }
-
     active = [fn for _, (fn, enabled) in fetcher_map.items() if enabled]
-
     jobs: List[Dict] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(active)) as ex:
         futures = {ex.submit(fn): fn.__name__ for fn in active}
-        for fut in concurrent.futures.as_completed(futures, timeout=60):
+        for fut in concurrent.futures.as_completed(futures, timeout=90):
             name = futures[fut]
             try:
                 result = fut.result()
                 jobs.extend(result)
-                log.info("%s returned %s jobs", name, len(result))
+                log.info("%s -> %d jobs", name, len(result))
             except Exception as e:
-                log.exception("Fetcher %s raised: %s", name, e)
-
-    for url in source_cfg.get("manual_search_urls", []):
-        jobs.append({
-            "source": "Manual Search URL",
-            "title": "Search results feed",
-            "company": "Various",
-            "location": "Canada/Remote",
-            "remote": True,
-            "url": url,
-            "date_posted": dt.datetime.now().isoformat(),
-            "description": "Manual job-board search URL.",
-        })
-
+                log.exception("Fetcher %s: %s", name, e)
     seen, deduped = set(), []
     for j in jobs:
-        key = (j.get("url") or "", j.get("title") or "", j.get("company") or "")
+        key = j.get("url") or f"{j.get('company')}|{j.get('title')}"
         if key not in seen:
             seen.add(key)
             deduped.append(j)
-
-    max_results = cfg["search"].get("max_results_per_run", 1000)
-    deduped = deduped[:max_results]
     (DATA / "jobs_raw.json").write_text(
         json.dumps(deduped, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    log.info("Total unique jobs fetched: %s", len(deduped))
+    log.info("Total unique jobs: %d", len(deduped))
     return deduped
 
+
+# ── Scoring ───────────────────────────────────────────────────────────────────
 
 def score_job(job: Dict, cfg: Dict) -> int:
     blob = f"{job.get('title','')} {job.get('description','')} {job.get('location','')}".lower()
     score = 0
-    for role in cfg["roles"]["primary"]:
-        if role.lower() in blob:
-            score += 18
-    for role in cfg["roles"]["secondary"]:
-        if role.lower() in blob:
-            score += 10
-    for kw in cfg["keywords"]["strongest"]:
-        if kw.lower() in blob:
-            score += 4
-    for kw in cfg["keywords"].get("support", []):
-        if kw.lower() in blob:
-            score += 2
-    if job.get("remote"):
-        score += 10
-    if "canada" in blob or "calgary" in blob or "alberta" in blob:
-        score += 10
-    for bad in cfg["search"].get("excluded_terms", []):
-        if bad.lower() in blob:
-            score -= 25
+    for role in cfg.get("roles", {}).get("primary", []):
+        if role.lower() in blob: score += 18
+    for role in cfg.get("roles", {}).get("secondary", []):
+        if role.lower() in blob: score += 10
+    for kw in cfg.get("keywords", {}).get("strongest", []):
+        if kw.lower() in blob: score += 4
+    for kw in cfg.get("keywords", {}).get("support", []):
+        if kw.lower() in blob: score += 2
+    if job.get("remote"): score += 8
+    if any(x in blob for x in ["canada", "calgary", "alberta"]): score += 10
+    for bad in cfg.get("search", {}).get("excluded_terms", []):
+        if bad.lower() in blob: score -= 20
     return max(0, min(100, score))
 
 
-def score_jobs(cfg, jobs: List[Dict]) -> List[Dict]:
+def score_and_save(cfg, jobs: List[Dict]) -> List[Dict]:
     for j in jobs:
         j["match_score"] = score_job(j, cfg)
-        j["status"] = "New"
+        j["email_found"] = find_email(j.get("description", ""))
     jobs.sort(key=lambda x: x.get("match_score", 0), reverse=True)
-
-    fields = ["match_score", "title", "company", "location", "remote", "source", "date_posted", "url", "status"]
+    fields = ["match_score", "title", "company", "location", "remote",
+              "source", "date_posted", "url", "email_found"]
     with open(DATA / "jobs_scored.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
         for j in jobs:
-            writer.writerow({k: j.get(k, "") for k in fields})
+            w.writerow({k: j.get(k, "") for k in fields})
     return jobs
 
 
-def choose_summary(job: Dict) -> str:
+# ── Email auto-apply ──────────────────────────────────────────────────────────
+
+def send_application(job: Dict, resume_path: str, cfg: Dict) -> bool:
+    to_email = job.get("email_found")
+    if not to_email:
+        return False
+    ecfg = cfg.get("email", {})
+    from_email = ecfg.get("from_email") or os.environ.get("EMAIL_FROM", "")
+    password   = os.environ.get("EMAIL_PASSWORD") or ecfg.get("password", "")
+    if not from_email or not password:
+        return False
     try:
-        variants = yaml.safe_load(
-            (BASE / "templates" / "resume_summary_variants.yaml").read_text(encoding="utf-8")
+        msg = MIMEMultipart()
+        msg["From"]    = from_email
+        msg["To"]      = to_email
+        msg["Subject"] = f"Application — {job.get('title')} | Vaughn Krogman"
+        body = (
+            f"Dear Hiring Team at {job.get('company', '')},\n\n"
+            f"I am writing to apply for the {job.get('title', '')} position.\n\n"
+            "I bring 20+ years of automotive finance, sales leadership, special finance, "
+            "lender relations, CRM, and dealership growth experience. I would welcome "
+            "the opportunity to contribute immediate value to your team.\n\n"
+            "Please find my resume attached. I look forward to discussing this opportunity.\n\n"
+            "Sincerely,\nVaughn Krogman\nCalgary, Alberta\n"
+            "825-779-1000 | vaughnk2025@gmail.com"
         )
-    except Exception:
-        return "See attached resume."
-    text = f"{job.get('title','')} {job.get('description','')}".lower()
-    if any(x in text for x in ["f&i", "finance manager", "finance director", "special finance", "lender"]):
-        return variants.get("automotive_finance", "")
-    if any(x in text for x in ["general sales", "sales manager", "team", "dealership sales"]):
-        return variants.get("sales_leadership", "")
-    if any(x in text for x in ["saas", "software", "account executive", "demo", "crm"]):
-        return variants.get("automotive_saas", "")
-    if any(x in text for x in ["business development", "partnership", "pipeline"]):
-        return variants.get("business_development", "")
-    return variants.get("remote_sales" if job.get("remote") else "sales_leadership", "")
+        msg.attach(MIMEText(body, "plain"))
+        if resume_path and Path(resume_path).exists():
+            with open(resume_path, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition",
+                            f'attachment; filename="{Path(resume_path).name}"')
+            msg.attach(part)
+        smtp_host = ecfg.get("smtp_host", "smtp.gmail.com")
+        smtp_port = int(ecfg.get("smtp_port", 587))
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as srv:
+            srv.starttls()
+            srv.login(from_email, password)
+            srv.send_message(msg)
+        log.info("Email sent -> %s for %s @ %s", to_email, job.get("title"), job.get("company"))
+        return True
+    except Exception as e:
+        log.exception("Email send failed: %s", e)
+        return False
 
 
-def create_packets(cfg, jobs: List[Dict]) -> int:
-    min_score = cfg["search"].get("min_score_to_package", 65)
+def auto_apply(scored_jobs: List[Dict], cfg: Dict) -> int:
+    min_score = cfg.get("search", {}).get("min_score_to_apply", 10)
+    with _state_lock:
+        resume_path = _state.get("resume_path")
     count = 0
-    for j in jobs:
-        if j["match_score"] < min_score:
+    for job in scored_jobs:
+        if job.get("match_score", 0) < min_score:
             continue
-        safe = re.sub(r"[^a-zA-Z0-9]+", "_", f"{j.get('company','company')}_{j.get('title','job')}").strip("_")[:80]
-        folder = PACKETS / safe
-        folder.mkdir(parents=True, exist_ok=True)
-        cover = f"""Dear Hiring Manager,
-
-I am applying for the {j.get('title')} role with {j.get('company')}. My background aligns strongly with this position because I bring more than 20 years of automotive finance, sales leadership, special finance, lender relations, business development, CRM, and technology-driven dealership growth experience.
-
-What separates me from a typical candidate is that I understand dealership operations from the floor, the finance office, and the technology side. I have led finance departments, coached teams, built credit rebuild programs, improved warranty and product penetration, and developed CRM and lead-generation workflows that improve conversion and profitability.
-
-For this role, I would bring immediate value through disciplined pipeline management, strong negotiation, lender and client relationship development, process improvement, and a results-first approach to revenue growth.
-
-Sincerely,
-Vaughn Krogman
-Calgary, Alberta
-825-779-1000
-vaughnk2025@gmail.com
-"""
-        (folder / "tailored_summary.txt").write_text(choose_summary(j), encoding="utf-8")
-        (folder / "cover_letter.txt").write_text(cover, encoding="utf-8")
-        (folder / "job_url.txt").write_text(j.get("url") or "", encoding="utf-8")
+        jid = db_upsert(job)
+        with _db() as c:
+            row = c.execute("SELECT status FROM jobs WHERE id=?", (jid,)).fetchone()
+        if row and row["status"] != "new":
+            continue
+        email_sent = send_application(job, resume_path or "", cfg)
+        db_mark_applied(jid, email_found=job.get("email_found") if email_sent else None)
         count += 1
     return count
 
 
+# ── Main run loop ─────────────────────────────────────────────────────────────
+
 def run_all():
     with _state_lock:
         if _state["running"]:
-            return {"error": "Already running"}
+            return
         _state["running"] = True
         _state["last_run_status"] = "Running..."
-
     try:
-        cfg = load_config()
-        jobs = search_jobs(cfg)
-        scored = score_jobs(cfg, jobs)
-        packets = create_packets(cfg, scored)
-
-        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cfg    = load_config()
+        jobs   = search_jobs(cfg)
+        scored = score_and_save(cfg, jobs)
+        auto_apply(scored, cfg)
+        stats  = db_stats()
+        now    = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with _state_lock:
-            _state["last_run"] = now
-            _state["last_run_status"] = f"Completed at {now}"
-            _state["job_count"] = len(scored)
-            _state["packet_count"] = packets
-            _state["run_count"] += 1
-        log.info("run_all complete: %s jobs, %s packets", len(scored), packets)
-        return {"jobs": len(scored), "packets": packets, "timestamp": now}
+            _state["last_run"]         = now
+            _state["last_run_status"]  = f"Done at {now}"
+            _state["job_count"]        = len(scored)
+            _state["applied_count"]    = stats["applied"]
+            _state["interview_count"]  = stats["interview"]
+            _state["run_count"]       += 1
+        log.info("run_all done: %d jobs", len(scored))
     except Exception as e:
         log.exception("run_all failed: %s", e)
         with _state_lock:
             _state["last_run_status"] = f"Error: {e}"
-        return {"error": str(e)}
     finally:
         with _state_lock:
             _state["running"] = False
 
 
-def load_scored_jobs() -> List[Dict]:
+def load_all_jobs() -> List[Dict]:
     path = DATA / "jobs_scored.csv"
     if not path.exists():
         return []
@@ -411,374 +592,40 @@ def load_scored_jobs() -> List[Dict]:
     return sorted(jobs, key=lambda x: x["match_score"], reverse=True)
 
 
-# ── HTML dashboard ────────────────────────────────────────────────────────────
-
-HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>JobHawk — Vaughn Krogman</title>
-<style>
-  :root {
-    --bg:#0f1117;--card:#1a1d27;--border:#2a2d3e;
-    --accent:#4f8ef7;--accent2:#22d3a4;--warn:#f59e0b;
-    --text:#e2e8f0;--muted:#8892a4;
-    --high:#22d3a4;--mid:#f59e0b;--low:#ef4444;
-  }
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}
-  header{background:var(--card);border-bottom:1px solid var(--border);padding:18px 32px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
-  .logo{display:flex;align-items:center;gap:10px}
-  .logo-icon{font-size:28px}
-  .logo h1{font-size:22px;font-weight:700}
-  .logo span{color:var(--accent)}
-  .header-meta{color:var(--muted);font-size:13px}
-  .actions{display:flex;gap:10px;align-items:center}
-  .btn{padding:9px 20px;border-radius:8px;border:none;font-size:14px;font-weight:600;cursor:pointer;transition:opacity .15s,transform .1s}
-  .btn:hover{opacity:.85;transform:translateY(-1px)}
-  .btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
-  .btn-primary{background:var(--accent);color:#fff}
-  .btn-secondary{background:var(--border);color:var(--text)}
-  .status-bar{background:var(--card);border-bottom:1px solid var(--border);padding:10px 32px;display:flex;gap:32px;flex-wrap:wrap;font-size:13px}
-  .stat{display:flex;flex-direction:column;gap:2px}
-  .stat-label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
-  .stat-value{font-weight:600;font-size:15px}
-  .pulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent2);margin-right:6px;animation:pulse 1.5s infinite}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-  main{padding:24px 32px;max-width:1400px;margin:0 auto}
-
-  /* ── drop zone ── */
-  .drop-panel{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px 24px;margin-bottom:20px}
-  .drop-panel-title{font-size:13px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:14px}
-  .drop-zones{display:flex;gap:12px;flex-wrap:wrap}
-  .drop-zone{flex:1;min-width:200px;border:2px dashed var(--border);border-radius:10px;padding:20px;text-align:center;cursor:pointer;transition:border-color .2s,background .2s;position:relative}
-  .drop-zone:hover,.drop-zone.dragover{border-color:var(--accent);background:rgba(79,142,247,.06)}
-  .drop-zone.uploaded{border-color:var(--accent2);background:rgba(34,211,164,.06)}
-  .drop-zone input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
-  .drop-icon{font-size:28px;margin-bottom:8px}
-  .drop-label{font-size:14px;font-weight:600;color:var(--text)}
-  .drop-hint{font-size:12px;color:var(--muted);margin-top:4px}
-  .drop-filename{font-size:12px;color:var(--accent2);font-weight:600;margin-top:6px;word-break:break-all}
-
-  /* ── filters ── */
-  .filters{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap;align-items:flex-end}
-  .filter-group{display:flex;flex-direction:column;gap:4px}
-  .filter-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
-  select,input[type=text],input[type=range]{background:var(--card);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:7px 12px;font-size:13px;outline:none}
-  select:focus,input[type=text]:focus{border-color:var(--accent)}
-  .range-row{display:flex;gap:8px;align-items:center}
-  .range-val{font-size:13px;font-weight:600;color:var(--accent);min-width:28px}
-  #count-badge{font-size:13px;color:var(--muted);padding:6px 14px;background:var(--card);border:1px solid var(--border);border-radius:6px;align-self:flex-end}
-
-  /* ── job cards ── */
-  .jobs-grid{display:grid;gap:12px}
-  .job-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 20px;display:grid;grid-template-columns:64px 1fr auto;gap:16px;align-items:start;transition:border-color .15s}
-  .job-card:hover{border-color:var(--accent)}
-  .score-ring{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:800;flex-shrink:0}
-  .score-high{background:rgba(34,211,164,.15);color:var(--high);border:2px solid var(--high)}
-  .score-mid{background:rgba(245,158,11,.15);color:var(--mid);border:2px solid var(--mid)}
-  .score-low{background:rgba(239,68,68,.15);color:var(--low);border:2px solid var(--low)}
-  .job-info{overflow:hidden}
-  .job-title{font-size:16px;font-weight:700;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .job-company{font-size:14px;color:var(--accent);font-weight:600;margin-bottom:6px}
-  .job-meta{display:flex;gap:8px;flex-wrap:wrap}
-  .tag{font-size:11px;padding:3px 8px;border-radius:99px;background:var(--border);color:var(--muted)}
-  .tag-remote{background:rgba(79,142,247,.15);color:var(--accent)}
-  .tag-source{background:rgba(34,211,164,.1);color:var(--accent2)}
-  .job-actions{display:flex;flex-direction:column;gap:8px;align-items:flex-end}
-  .apply-btn{background:var(--accent);color:#fff;border:none;border-radius:7px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block;transition:opacity .15s;white-space:nowrap}
-  .apply-btn:hover{opacity:.85}
-  .date-tag{font-size:11px;color:var(--muted);text-align:right}
-  .empty{text-align:center;padding:60px 20px;color:var(--muted)}
-  .empty-icon{font-size:48px;margin-bottom:12px}
-  .empty h2{font-size:20px;margin-bottom:8px;color:var(--text)}
-  .toast{position:fixed;bottom:24px;right:24px;background:var(--card);border:1px solid var(--accent2);border-radius:10px;padding:14px 20px;font-size:14px;font-weight:600;color:var(--accent2);display:none;z-index:999;animation:slideIn .3s ease}
-  .toast.error{border-color:var(--low);color:var(--low)}
-  @keyframes slideIn{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
-  @media(max-width:700px){header,.status-bar,main{padding-left:16px;padding-right:16px}.job-card{grid-template-columns:48px 1fr}.job-actions{display:none}.drop-zones{flex-direction:column}}
-</style>
-</head>
-<body>
-<header>
-  <div class="logo">
-    <span class="logo-icon">🦅</span>
-    <div>
-      <h1>Job<span>Hawk</span></h1>
-      <div class="header-meta">Vaughn Krogman · Calgary, AB · 825-779-1000</div>
-    </div>
-  </div>
-  <div class="actions">
-    <button class="btn btn-secondary" onclick="downloadCSV()">⬇ Export CSV</button>
-    <button class="btn btn-primary" id="run-btn" onclick="runNow()">▶ Run Now</button>
-  </div>
-</header>
-
-<div class="status-bar">
-  <div class="stat"><span class="stat-label">Last Run</span><span class="stat-value" id="last-run">—</span></div>
-  <div class="stat"><span class="stat-label">Status</span><span class="stat-value" id="run-status">—</span></div>
-  <div class="stat"><span class="stat-label">Jobs Found</span><span class="stat-value" id="job-count">—</span></div>
-  <div class="stat"><span class="stat-label">Packets Ready</span><span class="stat-value" id="packet-count">—</span></div>
-  <div class="stat"><span class="stat-label">Next Auto-Run</span><span class="stat-value"><span class="pulse"></span><span id="next-run">4h</span></span></div>
-  <div class="stat"><span class="stat-label">Resume</span><span class="stat-value" id="resume-status" style="font-size:12px;color:var(--muted)">Not uploaded</span></div>
-  <div class="stat"><span class="stat-label">Cover Letter</span><span class="stat-value" id="cl-status" style="font-size:12px;color:var(--muted)">Not uploaded</span></div>
-</div>
-
-<main>
-  <!-- Resume + Cover Letter Drop Zones -->
-  <div class="drop-panel">
-    <div class="drop-panel-title">📎 Drop Your Files — uploads automatically on drop</div>
-    <div class="drop-zones">
-      <div class="drop-zone" id="resume-zone" ondragover="onDragOver(event,'resume-zone')" ondragleave="onDragLeave('resume-zone')" ondrop="onDrop(event,'resume')">
-        <input type="file" accept=".pdf,.doc,.docx,.txt" onchange="onFileSelect(event,'resume')">
-        <div class="drop-icon">📄</div>        <div class="drop-label">Resume</div>
-        <div class="drop-hint">PDF, DOC, DOCX — drag here or click</div>
-        <div class="drop-filename" id="resume-filename"></div>
-      </div>
-      <div class="drop-zone" id="cl-zone" ondragover="onDragOver(event,'cl-zone')" ondragleave="onDragLeave('cl-zone')" ondrop="onDrop(event,'cover_letter')">
-        <input type="file" accept=".pdf,.doc,.docx,.txt" onchange="onFileSelect(event,'cover_letter')">
-        <div class="drop-icon">📝</div>
-        <div class="drop-label">Cover Letter</div>
-        <div class="drop-hint">PDF, DOC, DOCX — drag here or click</div>
-        <div class="drop-filename" id="cl-filename"></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Filters -->
-  <div class="filters">
-    <div class="filter-group">
-      <span class="filter-label">Location</span>
-      <select id="loc-filter" onchange="applyFilters()">
-        <option value="all">All Locations</option>
-        <option value="remote">Remote</option>
-        <option value="canada">Canada</option>
-        <option value="usa">USA</option>
-        <option value="europe">Europe</option>
-        <option value="worldwide">Worldwide</option>
-      </select>
-    </div>
-    <div class="filter-group">
-      <span class="filter-label">Source</span>
-      <select id="src-filter" onchange="applyFilters()">
-        <option value="all">All Sources</option>
-        <option value="Remotive">Remotive</option>
-        <option value="Arbeitnow">Arbeitnow</option>
-        <option value="RemoteOK">RemoteOK</option>
-        <option value="WeWorkRemotely">WeWorkRemotely</option>
-        <option value="Jobicy">Jobicy</option>
-      </select>
-    </div>
-    <div class="filter-group">
-      <span class="filter-label">Search</span>
-      <input type="text" id="search-box" placeholder="title, company..." oninput="applyFilters()" style="width:200px">
-    </div>
-    <div class="filter-group">
-      <span class="filter-label">Min Score: <span id="score-val">0</span></span>
-      <div class="range-row">
-        <input type="range" id="score-range" min="0" max="100" value="0" oninput="document.getElementById('score-val').textContent=this.value;applyFilters()" style="width:120px">
-      </div>
-    </div>
-    <span id="count-badge">0 jobs</span>
-  </div>
-
-  <!-- Job Cards -->
-  <div class="jobs-grid" id="jobs-grid">
-    <div class="empty">
-      <div class="empty-icon">&#x1f985;</div>
-      <h2>No jobs loaded yet</h2>
-      <p>Click <strong>Run Now</strong> to fetch jobs from all sources.</p>
-    </div>
-  </div>
-</main>
-
-<div class="toast" id="toast"></div>
-
-<script>
-const LOC_MAP = {
-  remote: ['remote'],
-  canada: ['canada','calgary','alberta','ca ','toronto','vancouver'],
-  usa: ['united states','usa',' us ','u.s.','america','new york','california'],
-  europe: ['europe','uk','germany','france','netherlands','spain','eu'],
-  worldwide: ['worldwide','anywhere','global','international'],
-};
-
-let ALL_JOBS = [];
-
-function showToast(msg, isError) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.className = 'toast' + (isError ? ' error' : '');
-  t.style.display = 'block';
-  setTimeout(function(){ t.style.display = 'none'; }, 3500);
-}
-
-async function loadStatus() {
-  try {
-    const r = await fetch('/api/status');
-    const d = await r.json();
-    document.getElementById('last-run').textContent = d.last_run || '---';
-    document.getElementById('run-status').textContent = d.last_run_status || '---';
-    document.getElementById('job-count').textContent = d.job_count != null ? d.job_count : '---';
-    document.getElementById('packet-count').textContent = d.packet_count != null ? d.packet_count : '---';
-    if (d.resume_name) {
-      const el = document.getElementById('resume-status');
-      el.textContent = d.resume_name; el.style.color = 'var(--accent2)';
-    }
-    if (d.cover_letter_name) {
-      const el = document.getElementById('cl-status');
-      el.textContent = d.cover_letter_name; el.style.color = 'var(--accent2)';
-    }
-    const btn = document.getElementById('run-btn');
-    btn.disabled = !!d.running;
-    btn.textContent = d.running ? 'Running...' : 'Run Now';
-  } catch(e) {}
-}
-
-async function loadJobs() {
-  try {
-    const r = await fetch('/api/jobs');
-    ALL_JOBS = await r.json();
-    applyFilters();
-  } catch(e) {}
-}
-
-function scoreClass(s) {
-  if (s >= 65) return 'score-high';
-  if (s >= 35) return 'score-mid';
-  return 'score-low';
-}
-
-function applyFilters() {
-  const loc = document.getElementById('loc-filter').value;
-  const src = document.getElementById('src-filter').value;
-  const q = document.getElementById('search-box').value.toLowerCase();
-  const minScore = parseInt(document.getElementById('score-range').value) || 0;
-  const filtered = ALL_JOBS.filter(function(j) {
-    const locStr = (j.location || '').toLowerCase();
-    if (loc !== 'all') {
-      const kws = LOC_MAP[loc] || [];
-      if (!kws.some(function(k){ return locStr.includes(k); })) return false;
-    }
-    if (src !== 'all' && j.source !== src) return false;
-    if (q && !(j.title+' '+j.company+' '+j.location).toLowerCase().includes(q)) return false;
-    if ((parseInt(j.match_score)||0) < minScore) return false;
-    return true;
-  });
-  document.getElementById('count-badge').textContent = filtered.length + ' jobs';
-  const grid = document.getElementById('jobs-grid');
-  if (!filtered.length) {
-    grid.innerHTML = '<div class="empty"><div class="empty-icon">&#x1f50d;</div><h2>No jobs match</h2><p>Try adjusting your filters.</p></div>';
-    return;
-  }
-  grid.innerHTML = filtered.map(function(j) {
-    const sc = parseInt(j.match_score) || 0;
-    const cls = scoreClass(sc);
-    const remote = j.remote === 'True' || j.remote === true;
-    return '<div class="job-card">'
-      + '<div class="score-ring ' + cls + '">' + sc + '</div>'
-      + '<div class="job-info">'
-      + '<div class="job-title">' + (j.title||'') + '</div>'
-      + '<div class="job-company">' + (j.company||'') + '</div>'
-      + '<div class="job-meta">'
-      + (remote ? '<span class="tag tag-remote">Remote</span>' : '')
-      + '<span class="tag">' + (j.location||'') + '</span>'
-      + '<span class="tag tag-source">' + (j.source||'') + '</span>'
-      + '</div></div>'
-      + '<div class="job-actions">'
-      + '<a class="apply-btn" href="' + (j.url||'#') + '" target="_blank" rel="noopener">Apply</a>'
-      + '<div class="date-tag">' + (j.date_posted||'') + '</div>'
-      + '</div></div>';
-  }).join('');
-}
-
-async function runNow() {
-  document.getElementById('run-btn').disabled = true;
-  document.getElementById('run-btn').textContent = 'Running...';
-  try {
-    const r = await fetch('/api/run', {method:'POST'});
-    const d = await r.json();
-    if (d.error) showToast('Error: ' + d.error, true);
-    else showToast('Done - ' + d.jobs + ' jobs, ' + d.packets + ' packets');
-  } catch(e) { showToast('Request failed', true); }
-  await loadStatus();
-  await loadJobs();
-}
-
-function downloadCSV() { window.open('/api/download', '_blank'); }
-
-function onDragOver(e, zoneId) {
-  e.preventDefault();
-  document.getElementById(zoneId).classList.add('dragover');
-}
-function onDragLeave(zoneId) {
-  document.getElementById(zoneId).classList.remove('dragover');
-}
-function onDrop(e, fileType) {
-  e.preventDefault();
-  const zoneId = fileType === 'resume' ? 'resume-zone' : 'cl-zone';
-  document.getElementById(zoneId).classList.remove('dragover');
-  const file = e.dataTransfer.files[0];
-  if (file) uploadFile(file, fileType);
-}
-function onFileSelect(e, fileType) {
-  const file = e.target.files[0];
-  if (file) uploadFile(file, fileType);
-}
-async function uploadFile(file, fileType) {
-  const zoneId = fileType === 'resume' ? 'resume-zone' : 'cl-zone';
-  const nameEl = document.getElementById(fileType === 'resume' ? 'resume-filename' : 'cl-filename');
-  const statusEl = document.getElementById(fileType === 'resume' ? 'resume-status' : 'cl-status');
-  nameEl.textContent = 'Uploading...';
-  try {
-    const fd = new FormData();
-    fd.append('file', file);
-    fd.append('type', fileType);
-    const r = await fetch('/api/upload', {method:'POST', body:fd});
-    const d = await r.json();
-    if (d.ok) {
-      document.getElementById(zoneId).classList.add('uploaded');
-      nameEl.textContent = d.name;
-      statusEl.textContent = d.name;
-      statusEl.style.color = 'var(--accent2)';
-      showToast('Uploaded: ' + d.name);
-    } else { nameEl.textContent = 'Upload failed'; showToast('Upload failed', true); }
-  } catch(e) { nameEl.textContent = 'Error'; showToast('Upload error', true); }
-}
-
-loadStatus();
-loadJobs();
-setInterval(loadStatus, 15000);
-setInterval(loadJobs, 60000);
-</script>
-</body>
-</html>"""
-
-
 # ── Flask routes ──────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    return render_template("index.html")
 
 
 @app.route("/api/status")
 def api_status():
     with _state_lock:
-        return jsonify(dict(_state))
+        s = dict(_state)
+    s.update(db_stats())
+    return jsonify(s)
 
 
 @app.route("/api/jobs")
 def api_jobs():
-    return jsonify(load_scored_jobs())
+    return jsonify(load_all_jobs())
+
+
+@app.route("/api/applied")
+def api_applied():
+    return jsonify(db_applied())
+
+
+@app.route("/api/interviews")
+def api_interviews():
+    return jsonify(db_interviews())
 
 
 @app.route("/api/run", methods=["POST"])
 def api_run():
-    import threading
-    t = threading.Thread(target=run_all, daemon=True)
-    t.start()
-    return jsonify({"ok": True, "message": "Run started"})
+    threading.Thread(target=run_all, daemon=True).start()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/download")
@@ -794,28 +641,55 @@ def api_download():
 def api_upload():
     if "file" not in request.files:
         return jsonify({"ok": False, "error": "no file"}), 400
-    f = request.files["file"]
-    file_type = request.form.get("type", "resume")
-    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", f.filename)
-    dest = UPLOADS / f"{file_type}_{safe_name}"
+    f  = request.files["file"]
+    ft = request.form.get("type", "resume")
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", f.filename)
+    dest = UPLOADS / f"{ft}_{safe}"
     f.save(str(dest))
     with _state_lock:
-        if file_type == "resume":
+        if ft == "resume":
             _state["resume_name"] = f.filename
+            _state["resume_path"] = str(dest)
         else:
             _state["cover_letter_name"] = f.filename
-    return jsonify({"ok": True, "name": f.filename, "type": file_type})
+            _state["cover_letter_path"] = str(dest)
+    try:
+        _paths_file.write_text(json.dumps({
+            "resume_name":       _state.get("resume_name"),
+            "resume_path":       _state.get("resume_path"),
+            "cover_letter_name": _state.get("cover_letter_name"),
+            "cover_letter_path": _state.get("cover_letter_path"),
+        }))
+    except Exception:
+        pass
+    return jsonify({"ok": True, "name": f.filename, "type": ft})
 
 
-# ── scheduler ─────────────────────────────────────────────────────────────────
+@app.route("/api/job/status", methods=["POST"])
+def api_job_status():
+    data   = request.get_json(force=True)
+    jid    = data.get("id", "")
+    status = data.get("status", "")
+    notes  = data.get("notes", "")
+    if not jid or not status:
+        return jsonify({"ok": False}), 400
+    db_update_status(jid, status, notes)
+    stats = db_stats()
+    with _state_lock:
+        _state["applied_count"]   = stats["applied"]
+        _state["interview_count"] = stats["interview"]
+    return jsonify({"ok": True})
+
+
+# ── Scheduler — every 15 minutes ─────────────────────────────────────────────
 
 def _bg_run():
-    log.info("Scheduled run starting")
+    log.info("Scheduled scan")
     run_all()
 
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(_bg_run, "interval", hours=4, id="jobhawk_scan")
+scheduler.add_job(_bg_run, "interval", minutes=15, id="jobhawk_scan")
 scheduler.start()
 
 import threading as _th

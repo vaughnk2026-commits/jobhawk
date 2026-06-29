@@ -11,11 +11,11 @@ profile:
     - Remote
 
 search:
-  max_results_per_run: 500
+  max_results_per_run: 10000   # No practical limit — get everything
   include_remote: true
   include_canada_wide: true
-  min_score_to_package: 65
-  min_score_to_notify: 75
+  min_score_to_package: 20     # Low threshold — apply to everything relevant
+  min_score_to_apply: 10       # Auto-apply threshold (email where contact found)
   excluded_terms:
     - entry level
     - unpaid
@@ -40,6 +40,8 @@ roles:
     - Digital Retailing Manager
     - F&I Trainer
     - Remote B2B Sales
+    - Account Executive
+    - Sales Director
 
 keywords:
   strongest:
@@ -81,7 +83,9 @@ sources:
   remotive: true
   arbeitnow: true
   remoteok: true
-  manual_search_urls:
-    - https://ca.indeed.com/jobs?q=automotive+finance+manager&l=Canada
-    - https://www.linkedin.com/jobs/search/?keywords=Automotive%20Finance%20Manager&location=Canada
-    - https://www.linkedin.com/jobs/search/?keywords=Business%20Development%20Manager%20Automotive&location=Canada
+  weworkremotely: true
+  jobicy: true
+  indeed: true
+  linkedin: true
+
+  # Indeed RSS search queries (runs eac
