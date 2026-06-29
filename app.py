@@ -13,14 +13,14 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import (
-    Flask, jsonify, redirect, render_template,
-    request, send_file, session, url_for,
+    Flask, Response, jsonify, redirect, render_template,
+    request, session, url_for,
 )
 from flask_login import (
     LoginManager, UserMixin, current_user,
     login_required, login_user, logout_user,
 )
-from passlib.hash import bcrypt as _bcrypt
+from werkzeug.security import generate_password_hash, check_password_hash
 from apscheduler.schedulers.background import BackgroundScheduler
 
 import models
@@ -41,23 +41,22 @@ for _d in [UPLOADS, LOGS]:
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
-    filename=LOGS / "jobhawk.log",
+    filename=str(LOGS / "jobhawk.log"),
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger(__name__)
 
-# ── Flask setup ───────────────────────────────────────────────────────────────
+# ── Flask ─────────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", os.urandom(32))
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(32).hex())
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 login_manager = LoginManager(app)
 login_manager.login_view = "login_page"
 login_manager.login_message = "Please sign in to continue."
 
-# WebAuthn config — set RP_ID to your actual domain in production
 RP_ID     = os.environ.get("RP_ID", "localhost")
 RP_NAME   = "JobHawk"
 WA_ORIGIN = os.environ.get("WA_ORIGIN", f"https://{RP_ID}")
@@ -67,7 +66,7 @@ models.init_db()
 # ── Flask-Login user object ───────────────────────────────────────────────────
 
 class User(UserMixin):
-    def __init__(self, row: dict):
+    def __init__(self, row):
         self.id    = row["id"]
         self.email = row["email"]
         self.name  = row.get("name") or ""
@@ -77,17 +76,13 @@ def load_user(uid):
     row = models.user_by_id(int(uid))
     return User(row) if row else None
 
-
-# ── Scan state (in-memory, global) ───────────────────────────────────────────
+# ── Scan state ────────────────────────────────────────────────────────────────
 
 _scan_state = {
-    "running": False,
-    "last_ran": None,
-    "last_status": "Never run",
-    "run_count": 0,
+    "running": False, "last_ran": None,
+    "last_status": "Never run", "run_count": 0,
 }
 _scan_lock = threading.Lock()
-
 
 # ── Background scan ───────────────────────────────────────────────────────────
 
@@ -96,26 +91,19 @@ def _run_scan():
         if _scan_state["running"]:
             return
         _scan_state["running"]     = True
-        _scan_state["last_status"] = "Running…"
-
+        _scan_state["last_status"] = "Running..."
     try:
-        log.info("Global scan started")
         raw_jobs = scrapers.fetch_all_jobs()
-
-        user_ids = models.user_all_ids()
-        for uid in user_ids:
+        for uid in models.user_all_ids():
             try:
                 _process_user(uid, raw_jobs)
             except Exception as ue:
-                log.exception("Error processing user %s: %s", uid, ue)
-
+                log.exception("User %s scan error: %s", uid, ue)
         now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with _scan_lock:
             _scan_state["last_ran"]    = now
-            _scan_state["last_status"] = f"Done — {len(raw_jobs)} jobs scraped, {now}"
+            _scan_state["last_status"] = f"Done — {len(raw_jobs)} jobs, {now}"
             _scan_state["run_count"]  += 1
-        log.info("Global scan done: %d raw jobs", len(raw_jobs))
-
     except Exception as e:
         log.exception("Scan failed: %s", e)
         with _scan_lock:
@@ -125,43 +113,28 @@ def _run_scan():
             _scan_state["running"] = False
 
 
-def _process_user(uid: int, raw_jobs: list):
-    """Score raw jobs against a user's profile and auto-apply."""
+def _process_user(uid, raw_jobs):
     user    = models.user_by_id(uid)
     profile = models.profile_get(uid)
-
     if not profile.get("resume_name"):
-        return   # user hasn't finished onboarding yet
-
-    enriched = scorer.enrich_jobs(raw_jobs, profile)
+        return
+    enriched  = scorer.enrich_jobs(raw_jobs, profile)
     min_score = int(profile.get("min_score") or 10)
-    applied_this_run = []
-
+    applied   = []
     for j in enriched:
         if j.get("match_score", 0) < min_score:
             continue
         jid = models.job_upsert(uid, j)
-
-        # Auto-apply if contact email found and not already applied
-        if j.get("email_found"):
-            import sqlite3
-            with models._db() as c:
-                row = c.execute(
-                    "SELECT status FROM jobs WHERE id=? AND user_id=?", (jid, uid)
-                ).fetchone()
-            if row and row["status"] == "new":
-                sent = mailer.send_application(
-                    j, user, profile, profile.get("resume_path")
-                )
-                if sent:
-                    models.job_mark_applied(uid, jid, j.get("email_found"))
-                    applied_this_run.append(j)
-                else:
-                    models.job_mark_applied(uid, jid)   # mark applied even without email send
-
-    if applied_this_run and user.get("notify_email"):
-        mailer.notify_user_digest(user, profile, applied_this_run)
-
+        with models._db() as c:
+            row = c.execute("SELECT status FROM jobs WHERE id=? AND user_id=?",
+                            (jid, uid)).fetchone()
+        if row and row["status"] == "new":
+            sent = mailer.send_application(j, user, profile, profile.get("resume_path"))
+            models.job_mark_applied(uid, jid, j.get("email_found") if sent else None)
+            if sent:
+                applied.append(j)
+    if applied and user.get("notify_email"):
+        mailer.notify_user_digest(user, profile, applied)
 
 # ── Auth routes ───────────────────────────────────────────────────────────────
 
@@ -171,13 +144,11 @@ def home():
         return redirect(url_for("dashboard"))
     return redirect(url_for("login_page"))
 
-
-@app.route("/login")
+@app.route("/login", methods=["GET"])
 def login_page():
     if current_user.is_authenticated:
         return redirect(url_for("dashboard"))
     return render_template("login.html")
-
 
 @app.route("/login", methods=["POST"])
 def login_post():
@@ -186,18 +157,16 @@ def login_post():
     row      = models.user_by_email(email)
     if not row or not row.get("password_hash"):
         return render_template("login.html", error="Invalid email or password.")
-    if not _bcrypt.verify(password, row["password_hash"]):
+    if not check_password_hash(row["password_hash"], password):
         return render_template("login.html", error="Invalid email or password.")
     login_user(User(row), remember=True)
     return redirect(url_for("dashboard"))
 
-
-@app.route("/signup")
+@app.route("/signup", methods=["GET"])
 def signup_page():
     if current_user.is_authenticated:
         return redirect(url_for("dashboard"))
     return render_template("signup.html")
-
 
 @app.route("/signup", methods=["POST"])
 def signup_post():
@@ -205,18 +174,14 @@ def signup_post():
     email    = (request.form.get("email") or "").lower().strip()
     password = request.form.get("password") or ""
     if not email or not password or len(password) < 8:
-        return render_template(
-            "signup.html",
-            error="Email and a password of at least 8 characters are required."
-        )
+        return render_template("signup.html",
+            error="Email and a password of at least 8 characters are required.")
     if models.user_by_email(email):
         return render_template("signup.html", error="That email is already registered.")
-    ph  = _bcrypt.hash(password)
+    ph  = generate_password_hash(password)
     uid = models.user_create(email, ph, name)
-    row = models.user_by_id(uid)
-    login_user(User(row), remember=True)
+    login_user(User(models.user_by_id(uid)), remember=True)
     return redirect(url_for("onboard_page"))
-
 
 @app.route("/logout")
 @login_required
@@ -224,56 +189,43 @@ def logout():
     logout_user()
     return redirect(url_for("login_page"))
 
-
 # ── Onboarding ────────────────────────────────────────────────────────────────
 
-@app.route("/onboard")
+@app.route("/onboard", methods=["GET"])
 @login_required
 def onboard_page():
-    profile = models.profile_get(current_user.id)
-    return render_template("onboard.html", profile=profile, user=current_user)
-
+    return render_template("onboard.html",
+        profile=models.profile_get(current_user.id), user=current_user)
 
 @app.route("/onboard", methods=["POST"])
 @login_required
 def onboard_post():
-    roles_raw    = request.form.get("target_roles", "")
-    keywords_raw = request.form.get("keywords", "")
-    exclude_raw  = request.form.get("exclude_terms", "")
-
     def split(s):
-        return [x.strip() for x in re.split(r"[,\n]+", s) if x.strip()]
-
+        return [x.strip() for x in re.split(r"[,\n]+", s or "") if x.strip()]
     models.profile_update(
         current_user.id,
-        location=request.form.get("location", "").strip(),
-        target_roles=split(roles_raw),
-        keywords=split(keywords_raw),
-        exclude_terms=split(exclude_raw),
-        min_score=int(request.form.get("min_score") or 10),
-        email_from=request.form.get("email_from", "").strip(),
-        email_password=request.form.get("email_password", ""),
-        smtp_host=request.form.get("smtp_host", "smtp.gmail.com").strip(),
-        smtp_port=int(request.form.get("smtp_port") or 587),
+        location     = request.form.get("location", "").strip(),
+        target_roles = split(request.form.get("target_roles", "")),
+        keywords     = split(request.form.get("keywords", "")),
+        exclude_terms= split(request.form.get("exclude_terms", "")),
+        min_score    = int(request.form.get("min_score") or 10),
+        email_from   = request.form.get("email_from", "").strip(),
+        email_password = request.form.get("email_password", ""),
+        smtp_host    = request.form.get("smtp_host", "smtp.gmail.com").strip(),
+        smtp_port    = int(request.form.get("smtp_port") or 587),
     )
     return redirect(url_for("dashboard"))
-
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 
 @app.route("/dashboard")
 @login_required
 def dashboard():
-    profile = models.profile_get(current_user.id)
-    passkeys = models.passkeys_for_user(current_user.id)
-    return render_template(
-        "dashboard.html",
+    return render_template("dashboard.html",
         user=current_user,
-        profile=profile,
-        passkeys=passkeys,
-        rp_id=RP_ID,
-    )
-
+        profile=models.profile_get(current_user.id),
+        passkeys=models.passkeys_for_user(current_user.id),
+        rp_id=RP_ID)
 
 # ── User API ──────────────────────────────────────────────────────────────────
 
@@ -281,43 +233,37 @@ def dashboard():
 @login_required
 def api_status():
     uid  = current_user.id
-    s    = db_stats = models.db_stats(uid)
-    profile = models.profile_get(uid)
+    stats = models.db_stats(uid)
+    prof  = models.profile_get(uid)
     with _scan_lock:
         sc = dict(_scan_state)
     return jsonify({
-        **s,
-        **sc,
-        "resume_name":       profile.get("resume_name"),
-        "cover_letter_name": profile.get("cover_letter_name"),
-        "email_configured":  bool(profile.get("email_from") and profile.get("email_password")),
+        **stats, **sc,
+        "resume_name":       prof.get("resume_name"),
+        "cover_letter_name": prof.get("cover_letter_name"),
+        "email_configured":  bool(prof.get("email_from") and prof.get("email_password")),
     })
-
 
 @app.route("/api/jobs")
 @login_required
 def api_jobs():
     return jsonify(models.jobs_all(current_user.id))
 
-
 @app.route("/api/applied")
 @login_required
 def api_applied():
     return jsonify(models.jobs_applied(current_user.id))
-
 
 @app.route("/api/interviews")
 @login_required
 def api_interviews():
     return jsonify(models.jobs_interviews(current_user.id))
 
-
 @app.route("/api/run", methods=["POST"])
 @login_required
 def api_run():
     threading.Thread(target=_run_scan, daemon=True).start()
     return jsonify({"ok": True})
-
 
 @app.route("/api/download")
 @login_required
@@ -326,56 +272,37 @@ def api_download():
     jobs = models.jobs_all(current_user.id)
     if not jobs:
         return jsonify({"error": "No jobs yet"}), 404
-    fields = ["title", "company", "location", "source", "match_score",
-              "status", "url", "applied_at"]
-    output = io.StringIO()
-    w = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
-    w.writeheader()
-    w.writerows(jobs)
-    output.seek(0)
-    from flask import Response
-    return Response(
-        output.getvalue(), mimetype="text/csv",
-        headers={"Content-Disposition": "attachment; filename=jobhawk_results.csv"},
-    )
-
+    fields = ["title","company","location","source","match_score",
+              "status","url","applied_at"]
+    out = io.StringIO()
+    w   = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
+    w.writeheader(); w.writerows(jobs)
+    out.seek(0)
+    return Response(out.getvalue(), mimetype="text/csv",
+        headers={"Content-Disposition":"attachment; filename=jobhawk_results.csv"})
 
 @app.route("/api/upload", methods=["POST"])
 @login_required
 def api_upload():
     if "file" not in request.files:
         return jsonify({"ok": False, "error": "no file"}), 400
-    f    = request.files["file"]
+    f     = request.files["file"]
     ftype = request.form.get("type", "resume")
     safe  = re.sub(r"[^a-zA-Z0-9._-]", "_", f.filename)
     dest  = UPLOADS / f"{current_user.id}_{ftype}_{safe}"
     f.save(str(dest))
-
-    # Parse resume to extract skills
     parsed_skills = []
     if ftype == "resume":
         result = scorer.parse_resume(str(dest))
         parsed_skills = result.get("skills", [])
-        models.profile_update(
-            current_user.id,
-            resume_path=str(dest),
-            resume_name=f.filename,
-            parsed_skills=parsed_skills,
-        )
+        models.profile_update(current_user.id,
+            resume_path=str(dest), resume_name=f.filename,
+            parsed_skills=parsed_skills)
     else:
-        models.profile_update(
-            current_user.id,
-            cover_letter_path=str(dest),
-            cover_letter_name=f.filename,
-        )
-
-    return jsonify({
-        "ok": True,
-        "name": f.filename,
-        "type": ftype,
-        "skills_found": len(parsed_skills),
-    })
-
+        models.profile_update(current_user.id,
+            cover_letter_path=str(dest), cover_letter_name=f.filename)
+    return jsonify({"ok": True, "name": f.filename, "type": ftype,
+                    "skills_found": len(parsed_skills)})
 
 @app.route("/api/job/status", methods=["POST"])
 @login_required
@@ -387,167 +314,162 @@ def api_job_status():
     if not jid or not status:
         return jsonify({"ok": False}), 400
     models.job_update_status(current_user.id, jid, status, notes)
-    # Send interview notification if applicable
     if status == "interview":
-        user    = models.user_by_id(current_user.id)
-        profile = models.profile_get(current_user.id)
-        job = next((j for j in models.jobs_all(current_user.id) if j.get("id") == jid), {})
-        if job:
-            mailer.notify_interview(user, job)
+        user = models.user_by_id(current_user.id)
+        for j in models.jobs_all(current_user.id):
+            if j.get("id") == jid:
+                mailer.notify_interview(user, j)
+                break
     return jsonify({"ok": True})
-
 
 @app.route("/api/profile", methods=["GET"])
 @login_required
 def api_profile_get():
     return jsonify(models.profile_get(current_user.id))
 
-
 @app.route("/api/profile", methods=["POST"])
 @login_required
 def api_profile_post():
-    data = request.get_json(force=True) or {}
-    allowed = {
-        "location", "target_roles", "keywords", "exclude_terms",
-        "min_score", "email_from", "email_password", "smtp_host", "smtp_port",
-    }
-    update = {k: v for k, v in data.items() if k in allowed}
+    data    = request.get_json(force=True) or {}
+    allowed = {"location","target_roles","keywords","exclude_terms",
+               "min_score","email_from","email_password","smtp_host","smtp_port"}
+    update  = {k: v for k, v in data.items() if k in allowed}
     if update:
         models.profile_update(current_user.id, **update)
     return jsonify({"ok": True})
 
+# ── WebAuthn (Passkeys) — gracefully optional ─────────────────────────────────
 
-# ── WebAuthn (Passkeys) ───────────────────────────────────────────────────────
-
-def _wa_available():
+def _wa():
     try:
-        import webauthn  # noqa: F401
-        return True
+        import webauthn
+        return webauthn
     except ImportError:
-        return False
+        return None
 
+def _parse_cred(cls, data):
+    """Parse webauthn credential model — works with both pydantic v1 and v2."""
+    raw = json.dumps(data)
+    try:
+        return cls.model_validate_json(raw)
+    except AttributeError:
+        return cls.parse_raw(raw)
 
 @app.route("/auth/passkey/register/begin", methods=["POST"])
 @login_required
 def passkey_register_begin():
-    if not _wa_available():
-        return jsonify({"error": "WebAuthn not installed"}), 500
-    import webauthn
-    from webauthn.helpers.structs import (
-        AuthenticatorSelectionCriteria,
-        ResidentKeyRequirement,
-        UserVerificationRequirement,
-    )
-    uid   = current_user.id
-    user  = models.user_by_id(uid)
-    existing = [
-        webauthn.helpers.structs.PublicKeyCredentialDescriptor(id=pk["credential_id"])
-        for pk in models.passkeys_for_user(uid)
-    ]
-    options = webauthn.generate_registration_options(
-        rp_id=RP_ID,
-        rp_name=RP_NAME,
-        user_id=str(uid).encode(),
-        user_name=user["email"],
-        user_display_name=user.get("name") or user["email"],
-        exclude_credentials=existing,
-        authenticator_selection=AuthenticatorSelectionCriteria(
-            resident_key=ResidentKeyRequirement.PREFERRED,
-            user_verification=UserVerificationRequirement.PREFERRED,
-        ),
-    )
-    session["wa_reg_challenge"] = options.challenge
-    return jsonify(json.loads(webauthn.options_to_json(options)))
-
+    wa = _wa()
+    if not wa:
+        return jsonify({"error": "WebAuthn not available"}), 503
+    try:
+        from webauthn.helpers.structs import (
+            AuthenticatorSelectionCriteria, ResidentKeyRequirement,
+            UserVerificationRequirement, PublicKeyCredentialDescriptor,
+        )
+        uid      = current_user.id
+        user_row = models.user_by_id(uid)
+        existing = [PublicKeyCredentialDescriptor(id=pk["credential_id"])
+                    for pk in models.passkeys_for_user(uid)]
+        opts = wa.generate_registration_options(
+            rp_id=RP_ID, rp_name=RP_NAME,
+            user_id=str(uid).encode(),
+            user_name=user_row["email"],
+            user_display_name=user_row.get("name") or user_row["email"],
+            exclude_credentials=existing,
+            authenticator_selection=AuthenticatorSelectionCriteria(
+                resident_key=ResidentKeyRequirement.PREFERRED,
+                user_verification=UserVerificationRequirement.PREFERRED,
+            ),
+        )
+        session["wa_reg_challenge"] = opts.challenge
+        return jsonify(json.loads(wa.options_to_json(opts)))
+    except Exception as e:
+        log.warning("passkey register begin: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/auth/passkey/register/complete", methods=["POST"])
 @login_required
 def passkey_register_complete():
-    if not _wa_available():
-        return jsonify({"error": "WebAuthn not installed"}), 500
-    import webauthn
-    from webauthn.helpers.structs import RegistrationCredential
+    wa = _wa()
+    if not wa:
+        return jsonify({"error": "WebAuthn not available"}), 503
     challenge = session.pop("wa_reg_challenge", None)
     if not challenge:
         return jsonify({"error": "No challenge in session"}), 400
     try:
-        cred = RegistrationCredential.parse_raw(json.dumps(request.get_json(force=True)))
-        verification = webauthn.verify_registration_response(
-            credential=cred,
-            expected_challenge=challenge,
-            expected_rp_id=RP_ID,
-            expected_origin=WA_ORIGIN,
+        from webauthn.helpers.structs import RegistrationCredential
+        cred = _parse_cred(RegistrationCredential, request.get_json(force=True))
+        v    = wa.verify_registration_response(
+            credential=cred, expected_challenge=challenge,
+            expected_rp_id=RP_ID, expected_origin=WA_ORIGIN,
         )
-        models.passkey_store(
-            current_user.id,
-            credential_id=verification.credential_id,
-            public_key=verification.credential_public_key,
-            label=request.json.get("label", "Passkey"),
-        )
+        models.passkey_store(current_user.id,
+            credential_id=v.credential_id,
+            public_key=v.credential_public_key)
         return jsonify({"ok": True})
     except Exception as e:
-        log.warning("Passkey register failed: %s", e)
+        log.warning("passkey register complete: %s", e)
         return jsonify({"error": str(e)}), 400
-
 
 @app.route("/auth/passkey/authenticate/begin", methods=["POST"])
 def passkey_authenticate_begin():
-    if not _wa_available():
-        return jsonify({"error": "WebAuthn not installed"}), 500
-    import webauthn
-    options = webauthn.generate_authentication_options(
-        rp_id=RP_ID,
-        user_verification=webauthn.helpers.structs.UserVerificationRequirement.PREFERRED,
-    )
-    session["wa_auth_challenge"] = options.challenge
-    return jsonify(json.loads(webauthn.options_to_json(options)))
-
+    wa = _wa()
+    if not wa:
+        return jsonify({"error": "WebAuthn not available"}), 503
+    try:
+        from webauthn.helpers.structs import UserVerificationRequirement
+        opts = wa.generate_authentication_options(
+            rp_id=RP_ID,
+            user_verification=UserVerificationRequirement.PREFERRED,
+        )
+        session["wa_auth_challenge"] = opts.challenge
+        return jsonify(json.loads(wa.options_to_json(opts)))
+    except Exception as e:
+        log.warning("passkey auth begin: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/auth/passkey/authenticate/complete", methods=["POST"])
 def passkey_authenticate_complete():
-    if not _wa_available():
-        return jsonify({"error": "WebAuthn not installed"}), 500
-    import webauthn
-    from webauthn.helpers.structs import AuthenticationCredential
+    wa = _wa()
+    if not wa:
+        return jsonify({"error": "WebAuthn not available"}), 503
     challenge = session.pop("wa_auth_challenge", None)
     if not challenge:
         return jsonify({"error": "No challenge"}), 400
     try:
+        from webauthn.helpers.structs import AuthenticationCredential
         data = request.get_json(force=True)
-        cred = AuthenticationCredential.parse_raw(json.dumps(data))
-        # Lookup stored passkey by raw credential id bytes
-        raw_id = webauthn.helpers.base64url_to_bytes(data["rawId"])
-        pk     = models.passkey_by_credential_id(raw_id)
+        cred = _parse_cred(AuthenticationCredential, data)
+        try:
+            raw_id = wa.helpers.base64url_to_bytes(data["rawId"])
+        except AttributeError:
+            from webauthn.helpers.bytes_helper import base64url_to_bytes
+            raw_id = base64url_to_bytes(data["rawId"])
+        pk = models.passkey_by_credential_id(raw_id)
         if not pk:
             return jsonify({"error": "Passkey not found"}), 404
-        verification = webauthn.verify_authentication_response(
-            credential=cred,
-            expected_challenge=challenge,
-            expected_rp_id=RP_ID,
-            expected_origin=WA_ORIGIN,
+        v = wa.verify_authentication_response(
+            credential=cred, expected_challenge=challenge,
+            expected_rp_id=RP_ID, expected_origin=WA_ORIGIN,
             credential_public_key=pk["public_key"],
             credential_current_sign_count=pk["sign_count"],
         )
-        models.passkey_update_sign_count(raw_id, verification.new_sign_count)
+        models.passkey_update_sign_count(raw_id, v.new_sign_count)
         user_row = models.user_by_id(pk["user_id"])
         if not user_row:
             return jsonify({"error": "User not found"}), 404
         login_user(User(user_row), remember=True)
         return jsonify({"ok": True})
     except Exception as e:
-        log.warning("Passkey auth failed: %s", e)
+        log.warning("passkey auth complete: %s", e)
         return jsonify({"error": str(e)}), 400
-
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(_run_scan, "interval", minutes=15, id="global_scan")
 scheduler.start()
-
-# Run one scan immediately on startup (in background)
 threading.Thread(target=_run_scan, daemon=True).start()
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
