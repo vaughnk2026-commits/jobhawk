@@ -25,13 +25,42 @@
 
       <!-- Step 2: Location -->
       <div class="card" style="margin-bottom:20px">
-        <h3 style="font-weight:700;margin-bottom:4px">2. Where are you based / looking?</h3>
+        <h3 style="font-weight:700;margin-bottom:4px">2. Where are you looking?</h3>
         <p style="color:#64748b;font-size:.85rem;margin-bottom:14px">
-          City, province, or "Remote" — used to weight local and remote results.
+          Select your location — JobHawk only applies to jobs in your area.
+          <strong style="color:#34d399">Remote jobs are always included</strong> regardless of location.
         </p>
-        <input class="form-input" type="text" name="location"
-          placeholder="Calgary, Alberta, Canada"
-          value="{{ profile.location or '' }}">
+
+        <div class="form-group">
+          <label>Country</label>
+          <select class="form-input" name="country" id="sel-country" onchange="updateProvinces()">
+            <option value="">— Select Country —</option>
+            <option value="Canada"{% if profile.country == 'Canada' %} selected{% endif %}>🇨🇦 Canada</option>
+            <option value="United States"{% if profile.country == 'United States' %} selected{% endif %}>🇺🇸 United States</option>
+            <option value="United Kingdom"{% if profile.country == 'United Kingdom' %} selected{% endif %}>🇬🇧 United Kingdom</option>
+            <option value="Australia"{% if profile.country == 'Australia' %} selected{% endif %}>🇦🇺 Australia</option>
+            <option value="Germany"{% if profile.country == 'Germany' %} selected{% endif %}>🇩🇪 Germany</option>
+            <option value="Netherlands"{% if profile.country == 'Netherlands' %} selected{% endif %}>🇳🇱 Netherlands</option>
+            <option value="France"{% if profile.country == 'France' %} selected{% endif %}>🇫🇷 France</option>
+            <option value="Ireland"{% if profile.country == 'Ireland' %} selected{% endif %}>🇮🇪 Ireland</option>
+            <option value="New Zealand"{% if profile.country == 'New Zealand' %} selected{% endif %}>🇳🇿 New Zealand</option>
+            <option value="Other"{% if profile.country and profile.country not in ['Canada','United States','United Kingdom','Australia','Germany','Netherlands','France','Ireland','New Zealand'] %} selected{% endif %}>🌍 Other</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>Province / State / Region</label>
+          <select class="form-input" name="province" id="sel-province">
+            <option value="">— Select Country First —</option>
+          </select>
+        </div>
+
+        <div class="form-group" style="margin-bottom:0">
+          <label>City <span style="color:#475569;font-weight:400">(optional — for precise local matching)</span></label>
+          <input class="form-input" type="text" name="city" id="inp-city"
+            placeholder="e.g. Calgary, Toronto, Vancouver"
+            value="{{ profile.city or '' }}">
+        </div>
       </div>
 
       <!-- Step 3: Keywords -->
@@ -120,4 +149,80 @@
     </form>
   </div>
 </div>
+
+<script>
+const PROVINCES = {
+  'Canada': [
+    'Alberta','British Columbia','Manitoba','New Brunswick',
+    'Newfoundland and Labrador','Northwest Territories','Nova Scotia',
+    'Nunavut','Ontario','Prince Edward Island','Quebec','Saskatchewan','Yukon'
+  ],
+  'United States': [
+    'Alabama','Alaska','Arizona','Arkansas','California','Colorado','Connecticut',
+    'Delaware','Florida','Georgia','Hawaii','Idaho','Illinois','Indiana','Iowa',
+    'Kansas','Kentucky','Louisiana','Maine','Maryland','Massachusetts','Michigan',
+    'Minnesota','Mississippi','Missouri','Montana','Nebraska','Nevada',
+    'New Hampshire','New Jersey','New Mexico','New York','North Carolina',
+    'North Dakota','Ohio','Oklahoma','Oregon','Pennsylvania','Rhode Island',
+    'South Carolina','South Dakota','Tennessee','Texas','Utah','Vermont',
+    'Virginia','Washington','West Virginia','Wisconsin','Wyoming'
+  ],
+  'Australia': [
+    'Australian Capital Territory','New South Wales','Northern Territory',
+    'Queensland','South Australia','Tasmania','Victoria','Western Australia'
+  ],
+  'United Kingdom': [
+    'England','Northern Ireland','Scotland','Wales'
+  ],
+  'Germany': [
+    'Baden-Württemberg','Bavaria','Berlin','Brandenburg','Bremen','Hamburg',
+    'Hesse','Lower Saxony','Mecklenburg-Vorpommern','North Rhine-Westphalia',
+    'Rhineland-Palatinate','Saarland','Saxony','Saxony-Anhalt',
+    'Schleswig-Holstein','Thuringia'
+  ],
+  'Netherlands': [
+    'Drenthe','Flevoland','Friesland','Gelderland','Groningen','Limburg',
+    'North Brabant','North Holland','Overijssel','South Holland','Utrecht','Zeeland'
+  ],
+  'France': [
+    'Auvergne-Rhône-Alpes','Bourgogne-Franche-Comté','Brittany',
+    'Centre-Val de Loire','Corsica','Grand Est','Hauts-de-France',
+    'Île-de-France','Normandy','Nouvelle-Aquitaine','Occitanie',
+    'Pays de la Loire','Provence-Alpes-Côte d\'Azur'
+  ],
+  'Ireland': [
+    'Connacht','Leinster','Munster','Ulster'
+  ],
+  'New Zealand': [
+    'Auckland','Bay of Plenty','Canterbury','Gisborne','Hawke\'s Bay',
+    'Manawatū-Whanganui','Marlborough','Nelson','Northland','Otago',
+    'Southland','Taranaki','Tasman','Waikato','Wellington','West Coast'
+  ]
+};
+
+const CURRENT_PROVINCE = "{{ profile.province or '' }}";
+
+function updateProvinces() {
+  const country = document.getElementById('sel-country').value;
+  const sel = document.getElementById('sel-province');
+  const list = PROVINCES[country] || [];
+
+  if (!list.length) {
+    sel.innerHTML = '<option value="">N/A — enter city below</option>';
+    return;
+  }
+
+  sel.innerHTML = '<option value="">— Select Province / State —</option>';
+  list.forEach(function(p) {
+    const opt = document.createElement('option');
+    opt.value = p;
+    opt.textContent = p;
+    if (p === CURRENT_PROVINCE) opt.selected = true;
+    sel.appendChild(opt);
+  });
+}
+
+// Init on load
+updateProvinces();
+</script>
 {% endblock %}

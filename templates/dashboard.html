@@ -104,8 +104,8 @@
       </select>
       <select id="f-remote" onchange="applyFilters()" style="background:#1a2233;border:1px solid #334155;color:#e2e8f0;padding:8px 10px;border-radius:7px;font-size:.85rem">
         <option value="">All Locations</option>
-        <option value="remote">Remote</option>
-        <option value="canada">Canada</option>
+        <option value="remote">Remote Only</option>
+        <option value="local">Local Only</option>
       </select>
       <select id="f-score" onchange="applyFilters()" style="background:#1a2233;border:1px solid #334155;color:#e2e8f0;padding:8px 10px;border-radius:7px;font-size:.85rem">
         <option value="0">Any Score</option>
@@ -114,7 +114,7 @@
         <option value="70">Score ≥ 70</option>
       </select>
     </div>
-    <div id="jobs-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px"></div>
+    <div id="jobs-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px"></div>
     <div id="jobs-empty" style="display:none;text-align:center;padding:60px 20px;color:#475569">
       <div style="font-size:2.5rem">🔍</div>
       <p style="margin-top:10px">No jobs yet — click <strong>Scan Now</strong> or wait for the next automatic scan.</p>
@@ -131,8 +131,8 @@
       <table id="applied-table" style="width:100%;border-collapse:collapse;font-size:.85rem">
         <thead>
           <tr style="border-bottom:1px solid #1e293b">
-            <th style="padding:10px 14px;text-align:left;color:#64748b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em">Job</th>
             <th style="padding:10px 14px;text-align:left;color:#64748b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em">Company</th>
+            <th style="padding:10px 14px;text-align:left;color:#64748b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em">Job</th>
             <th style="padding:10px 14px;text-align:left;color:#64748b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em">Source</th>
             <th style="padding:10px 14px;text-align:left;color:#64748b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em">Applied</th>
             <th style="padding:10px 14px;text-align:left;color:#64748b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em">Status</th>
@@ -191,10 +191,35 @@
 #dz-resume.has-file,#dz-cl.has-file{border-color:#059669;background:#064e3b22}
 tr:hover td{background:#1a2233}
 td{padding:10px 14px;border-bottom:1px solid #1e293b}
+.logo-img{width:34px;height:34px;border-radius:7px;object-fit:contain;background:#0f1117;border:1px solid #1e293b;flex-shrink:0}
 </style>
 
 <script>
 let allJobs = [];
+
+// ── Company logo helper ───────────────────────────────────────────────────────
+const JOB_BOARDS = ['linkedin','indeed','remotive','remoteok','arbeitnow',
+                    'weworkremotely','jobicy','lever','greenhouse','workable',
+                    'jobs.','careers.','job.','apply.'];
+
+function companyDomain(job) {
+  const url     = job.url || '';
+  const company = (job.company || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, '');
+    const isBoard = JOB_BOARDS.some(b => host.includes(b));
+    if (!isBoard && host) return host;
+  } catch(e) {}
+  return company ? company + '.com' : '';
+}
+
+function logoHtml(job, size) {
+  const sz = size || 34;
+  const domain = companyDomain(job);
+  if (!domain) return `<div style="width:${sz}px;height:${sz}px;border-radius:7px;background:#1e293b;border:1px solid #2d3748;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:.7rem;color:#475569">${(job.company||'?')[0].toUpperCase()}</div>`;
+  return `<img src="https://logo.clearbit.com/${domain}" alt="" style="width:${sz}px;height:${sz}px;border-radius:7px;object-fit:contain;background:#0f1117;border:1px solid #1e293b;flex-shrink:0"
+              onerror="this.outerHTML='<div style=\\'width:${sz}px;height:${sz}px;border-radius:7px;background:#1e293b;border:1px solid #2d3748;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:.9rem;color:#475569\\'>${(job.company||'?')[0].toUpperCase()}</div>'">`;
+}
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function showTab(name) {
@@ -255,17 +280,16 @@ async function loadJobs() {
 function applyFilters() {
   const q      = (document.getElementById('f-search').value || '').toLowerCase();
   const src    = (document.getElementById('f-source').value || '').toLowerCase();
-  const remote = document.getElementById('f-remote').value;
+  const loc    = document.getElementById('f-remote').value;
   const minSc  = parseInt(document.getElementById('f-score').value || '0');
   const f = allJobs.filter(j => {
     const blob = ((j.title||'') + ' ' + (j.company||'')).toLowerCase();
     if (q && !blob.includes(q)) return false;
     if (src && (j.source||'').toLowerCase() !== src) return false;
-    if (remote === 'remote' && !['true','1'].includes(String(j.remote))) return false;
-    if (remote === 'canada') {
-      const loc = (j.location||'').toLowerCase();
-      if (!loc.includes('canada') && !loc.includes('alberta') && !loc.includes('calgary')) return false;
-    }
+    const isRemote = ['true','1'].includes(String(j.remote)) ||
+                     (j.location||'').toLowerCase().includes('remote');
+    if (loc === 'remote' && !isRemote) return false;
+    if (loc === 'local'  &&  isRemote) return false;
     if ((parseInt(j.match_score)||0) < minSc) return false;
     return true;
   });
@@ -284,23 +308,25 @@ function renderJobGrid(jobs) {
   if (!jobs.length) { grid.innerHTML = ''; empty.style.display = 'block'; return; }
   empty.style.display = 'none';
   grid.innerHTML = jobs.map(j => {
-    const sc = parseInt(j.match_score) || 0;
-    const remote = ['true','1'].includes(String(j.remote));
+    const sc     = parseInt(j.match_score) || 0;
+    const remote = ['true','1'].includes(String(j.remote)) ||
+                   (j.location||'').toLowerCase().includes('remote');
     return `<div style="background:#1a2233;border:1px solid #2d3748;border-radius:11px;padding:16px;display:flex;flex-direction:column;gap:9px;transition:border-color .15s" onmouseover="this.style.borderColor='#3b82f6'" onmouseout="this.style.borderColor='#2d3748'">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
-        <div>
-          <div style="font-weight:700;font-size:.92rem;color:#e2e8f0;line-height:1.3">${j.title||'Unknown'}</div>
-          <div style="color:#60a5fa;font-size:.8rem;margin-top:3px;font-weight:600">${j.company||'—'}</div>
+      <div style="display:flex;align-items:flex-start;gap:10px">
+        ${logoHtml(j, 34)}
+        <div style="flex:1;min-width:0">
+          <div style="font-weight:700;font-size:.92rem;color:#e2e8f0;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${j.title||'Unknown'}</div>
+          <div style="color:#60a5fa;font-size:.8rem;margin-top:2px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${j.company||'—'}</div>
         </div>
-        <span style="font-size:.75rem;font-weight:700;padding:3px 8px;border-radius:6px;white-space:nowrap;${scoreStyle(sc)}">${sc}</span>
+        <span style="font-size:.75rem;font-weight:700;padding:3px 8px;border-radius:6px;white-space:nowrap;flex-shrink:0;${scoreStyle(sc)}">${sc}</span>
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:5px">
         <span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#1e3a5f;color:#93c5fd">${j.source||'?'}</span>
-        ${remote ? '<span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#064e3b;color:#6ee7b7">Remote</span>' : ''}
-        ${j.location ? `<span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#1e293b;color:#94a3b8">${j.location}</span>` : ''}
+        ${remote ? '<span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#064e3b;color:#6ee7b7">🌐 Remote</span>' : ''}
+        ${j.location && !remote ? `<span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#1e293b;color:#94a3b8">📍 ${j.location}</span>` : ''}
         ${j.email_found ? '<span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#451a03;color:#fcd34d">📧 Has email</span>' : ''}
       </div>
-      ${j.url ? `<a href="${j.url}" target="_blank" rel="noopener" style="font-size:.78rem;color:#60a5fa">🔗 View Job</a>` : ''}
+      ${j.url ? `<a href="${j.url}" target="_blank" rel="noopener" style="font-size:.78rem;color:#60a5fa;text-decoration:none">🔗 View Job →</a>` : ''}
     </div>`;
   }).join('');
 }
@@ -319,8 +345,13 @@ async function loadApplied() {
     const s = j.status || 'applied';
     const c = colors[s] || colors.new;
     return `<tr>
-      <td><a href="${j.url||'#'}" target="_blank">${j.title||'—'}</a></td>
-      <td style="color:#94a3b8">${j.company||'—'}</td>
+      <td>
+        <div style="display:flex;align-items:center;gap:8px">
+          ${logoHtml(j, 26)}
+          <span style="color:#94a3b8">${j.company||'—'}</span>
+        </div>
+      </td>
+      <td><a href="${j.url||'#'}" target="_blank" style="color:#93c5fd;text-decoration:none">${j.title||'—'}</a></td>
       <td><span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#1e3a5f;color:#93c5fd">${j.source||'—'}</span></td>
       <td style="color:#64748b;font-size:.78rem">${(j.applied_at||'').split('.')[0]}</td>
       <td><span style="font-size:.72rem;padding:3px 9px;border-radius:5px;font-weight:600;display:inline-block;background:${c}">${s}</span></td>
@@ -346,13 +377,18 @@ async function loadInterviews() {
   empty.style.display='none';
   grid.innerHTML = jobs.map(j => `
     <div style="background:#1a2233;border:1px solid #059669;border-radius:11px;padding:18px;display:flex;flex-direction:column;gap:10px">
-      <div style="color:#34d399;font-weight:700;font-size:.95rem">🎯 ${j.title||'—'}</div>
-      <div style="color:#60a5fa;font-size:.82rem;font-weight:600">${j.company||'—'}</div>
+      <div style="display:flex;align-items:center;gap:10px">
+        ${logoHtml(j, 38)}
+        <div>
+          <div style="color:#34d399;font-weight:700;font-size:.95rem">🎯 ${j.title||'—'}</div>
+          <div style="color:#60a5fa;font-size:.82rem;font-weight:600;margin-top:2px">${j.company||'—'}</div>
+        </div>
+      </div>
       <div style="display:flex;gap:5px">
         <span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#064e3b;color:#6ee7b7">Interview</span>
         <span style="font-size:.7rem;padding:2px 7px;border-radius:4px;background:#1e3a5f;color:#93c5fd">${j.source||'—'}</span>
       </div>
-      ${j.url ? `<a href="${j.url}" target="_blank" style="font-size:.8rem">🔗 View Job</a>` : ''}
+      ${j.url ? `<a href="${j.url}" target="_blank" style="font-size:.8rem;color:#60a5fa;text-decoration:none">🔗 View Job →</a>` : ''}
       <select onchange="setStatus('${j.id}',this.value)" style="background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:6px 10px;border-radius:6px;font-size:.8rem;width:100%">
         <option value="" disabled selected>Update status…</option>
         <option value="interview">Interview</option>

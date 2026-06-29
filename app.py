@@ -43,8 +43,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+# SECRET_KEY MUST be set as an env var on Render for sessions to persist across restarts.
+# Without it, a new random key is generated on each deploy, logging out all users.
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(32).hex())
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
+app.config["REMEMBER_COOKIE_DURATION"] = dt.timedelta(days=30)
 
 login_manager = LoginManager(app)
 login_manager.login_view  = "login_page"
@@ -148,7 +151,31 @@ def _process_user(uid, raw_jobs):
                 apply_cap -= 1
 
     if applied and user.get("notify_email"):
-        mailer.notify_user_digest(user, profile, applied)
+        # Try platform email first, fall back to user's own SMTP credentials
+        p_email = os.environ.get("EMAIL_FROM", "")
+        p_pass  = os.environ.get("EMAIL_PASSWORD", "")
+        if not p_email or not p_pass:
+            p_email = profile.get("email_from", "")
+            p_pass  = profile.get("email_password", "")
+        if p_email and p_pass:
+            mailer.notify_user_digest(user, profile, applied, p_email, p_pass)
+
+
+# ── Keep-alive (prevents Render free tier from spinning down) ─────────────────
+
+def _keep_alive():
+    try:
+        import requests as _req
+        host = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+        if host:
+            _req.get(f"{host}/ping", timeout=5)
+            log.info("Keep-alive ping sent to %s", host)
+    except Exception as e:
+        log.debug("Keep-alive ping failed: %s", e)
+
+@app.route("/ping")
+def ping():
+    return "ok", 200
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -206,8 +233,16 @@ def onboard_page():
 def onboard_post():
     def split(s):
         return [x.strip() for x in re.split(r"[,\n]+", s or "") if x.strip()]
+    country  = request.form.get("country", "").strip()
+    province = request.form.get("province", "").strip()
+    city     = request.form.get("city", "").strip()
+    # Build legacy location string for backward compat with scoring
+    location = ", ".join(p for p in [city, province, country] if p)
     models.profile_update(current_user.id,
-        location      = request.form.get("location","").strip(),
+        country       = country,
+        province      = province,
+        city          = city,
+        location      = location,
         target_roles  = split(request.form.get("target_roles","")),
         keywords      = split(request.form.get("keywords","")),
         exclude_terms = split(request.form.get("exclude_terms","")),
@@ -328,8 +363,9 @@ def api_profile_get():
 @login_required
 def api_profile_post():
     data = request.get_json(force=True) or {}
-    allowed = {"location","target_roles","keywords","exclude_terms","min_score",
-               "email_from","email_password","smtp_host","smtp_port"}
+    allowed = {"country","province","city","location","target_roles","keywords",
+               "exclude_terms","min_score","email_from","email_password",
+               "smtp_host","smtp_port"}
     update = {k: v for k, v in data.items() if k in allowed}
     if update:
         models.profile_update(current_user.id, **update)
@@ -445,11 +481,11 @@ def passkey_authenticate_complete():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-# ── Scheduler — every 15 min, NO startup scan ────────────────────────────────
-# (User clicks "Scan Now" for the first run; scheduler fires every 15 min after)
+# ── Scheduler — every 15 min scan + every 14 min keep-alive ──────────────────
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(_run_scan, "interval", minutes=15, id="global_scan")
+scheduler.add_job(_run_scan,    "interval", minutes=15, id="global_scan")
+scheduler.add_job(_keep_alive,  "interval", minutes=14, id="keep_alive")
 scheduler.start()
 
 if __name__ == "__main__":

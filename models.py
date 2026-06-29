@@ -48,6 +48,9 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS profiles (
                 user_id           INTEGER PRIMARY KEY REFERENCES users(id),
+                country           TEXT DEFAULT '',
+                province          TEXT DEFAULT '',
+                city              TEXT DEFAULT '',
                 location          TEXT DEFAULT '',
                 target_roles      TEXT DEFAULT '[]',
                 keywords          TEXT DEFAULT '[]',
@@ -88,6 +91,16 @@ def init_db():
                 status     TEXT DEFAULT 'ok'
             );
         """)
+        # Migrations: add new columns to existing databases
+        for col, defval in [
+            ("country",  "''"),
+            ("province", "''"),
+            ("city",     "''"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE profiles ADD COLUMN {col} TEXT DEFAULT {defval}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         c.commit()
 
 
@@ -145,7 +158,8 @@ def profile_get(uid: int) -> Dict:
         row = c.execute("SELECT * FROM profiles WHERE user_id=?", (uid,)).fetchone()
     if not row:
         return {
-            "user_id": uid, "location": "", "target_roles": [], "keywords": [],
+            "user_id": uid, "country": "", "province": "", "city": "",
+            "location": "", "target_roles": [], "keywords": [],
             "exclude_terms": [], "min_score": 10, "resume_path": "",
             "resume_name": "", "cover_letter_path": "", "cover_letter_name": "",
             "parsed_skills": [], "email_from": "", "email_password": "",

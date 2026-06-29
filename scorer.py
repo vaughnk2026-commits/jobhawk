@@ -1,6 +1,7 @@
 """
 JobHawk — Resume parsing + per-user job scoring.
 Location guard: non-remote jobs outside the user's location are excluded.
+Uses structured country/province/city fields when available.
 """
 
 import re
@@ -40,6 +41,23 @@ def _location_words(loc: str) -> List[str]:
     return [p.strip().lower() for p in re.split(r"[,/\s]+", loc or "") if len(p.strip()) > 2]
 
 
+def _user_location_words(profile: Dict) -> List[str]:
+    """Gather location tokens from structured fields and legacy `location` field."""
+    words = []
+    for field in ("city", "province", "country", "location"):
+        val = (profile.get(field) or "").strip()
+        if val:
+            words.extend(_location_words(val))
+    # deduplicate while preserving order
+    seen = set()
+    result = []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            result.append(w)
+    return result
+
+
 def location_ok(job: Dict, profile: Dict) -> bool:
     """
     Return True if the job is eligible for this user's location.
@@ -50,7 +68,7 @@ def location_ok(job: Dict, profile: Dict) -> bool:
     - Non-remote jobs: job location must contain at least one word
       from the user's configured location (city, province, country).
     """
-    job_loc  = (job.get("location") or "").lower()
+    job_loc = (job.get("location") or "").lower()
     is_remote = (
         job.get("remote")
         or "remote" in job_loc
@@ -61,11 +79,11 @@ def location_ok(job: Dict, profile: Dict) -> bool:
     if is_remote:
         return True
 
-    user_loc = (profile.get("location") or "").strip()
-    if not user_loc:
+    user_words = _user_location_words(profile)
+    if not user_words:
         return True   # user hasn't set a location — don't filter
 
-    for word in _location_words(user_loc):
+    for word in user_words:
         if word in job_loc:
             return True
 
@@ -127,8 +145,7 @@ def score_job(job: Dict, profile: Dict) -> int:
         if skill.lower() in blob: score += 5
     for kw in profile.get("keywords", []):
         if kw.lower() in blob: score += 4
-    user_loc = (profile.get("location") or "").lower()
-    for word in _location_words(user_loc):
+    for word in _user_location_words(profile):
         if word in blob: score += 8
     if job.get("remote") or "remote" in blob: score += 3
     if "canada" in blob: score += 5
