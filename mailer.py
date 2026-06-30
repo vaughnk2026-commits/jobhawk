@@ -85,25 +85,95 @@ def send_application(job, user, profile, resume_path=None) -> bool:
     return sent
 
 
-def notify_user_digest(user, profile, applied_jobs, platform_email=None, platform_password=None):
-    if not applied_jobs: return
-    to_email  = user.get("email")
-    from_email = platform_email or os.environ.get("EMAIL_FROM","")
-    password   = platform_password or os.environ.get("EMAIL_PASSWORD","")
-    if not to_email or not from_email or not password: return
-    name  = user.get("name") or "there"
-    count = len(applied_jobs)
-    lines = [f"  • {j.get('title','?')} at {j.get('company','?')} [{j.get('source','?')}] — {j.get('url','')}"
-             for j in applied_jobs[:50]]
-    body = (f"Hi {name},\n\nJobHawk applied to {count} job{'s' if count!=1 else ''} on your behalf:\n\n"
-            + "\n".join(lines)
-            + "\n\nLog in to your dashboard to track progress and mark interviews.\n\n— JobHawk")
+def notify_scan_results(user: Dict, profile: Dict, found_jobs: List[Dict],
+                        applied_jobs: List[Dict], opt_out_url: str = "") -> bool:
+    """
+    Send the user a scan-results email every time jobs are found.
+    Uses the user's own SMTP credentials (email_from / email_password).
+    Falls back to EMAIL_FROM / EMAIL_PASSWORD env vars.
+    Always sends — regardless of whether auto-apply ran.
+    """
+    to_email   = user.get("email", "")
+    from_email = (profile.get("email_from") or "").strip() or os.environ.get("EMAIL_FROM", "")
+    password   = (profile.get("email_password") or "").strip() or os.environ.get("EMAIL_PASSWORD", "")
+    smtp_host  = profile.get("smtp_host", "smtp.gmail.com") or "smtp.gmail.com"
+    smtp_port  = int(profile.get("smtp_port") or 587)
+
+    if not to_email or not from_email or not password:
+        log.debug("notify_scan_results: missing credentials — skipping (to=%s from=%s)", to_email, from_email)
+        return False
+
+    name          = user.get("name") or "there"
+    count_found   = len(found_jobs)
+    count_applied = len(applied_jobs)
+
+    # Subject line
+    subject = f"JobHawk: {count_found} job{'s' if count_found != 1 else ''} found for you"
+    if count_applied:
+        subject += f" · {count_applied} applied"
+
+    # Body
+    top = found_jobs[:25]
+    lines = []
+    for i, j in enumerate(top, 1):
+        remote_tag = " [Remote]" if j.get("remote") or "remote" in (j.get("location") or "").lower() else ""
+        applied_tag = " ✅ Applied" if j in applied_jobs else ""
+        lines.append(
+            f"  {i:2}. {j.get('title','?')} @ {j.get('company','?')}{remote_tag}{applied_tag}\n"
+            f"       {j.get('url','')}"
+        )
+
+    body_parts = [
+        f"Hi {name},",
+        "",
+        f"JobHawk just completed a scan and found {count_found} job{'s' if count_found != 1 else ''} matching your profile.",
+    ]
+
+    if count_applied:
+        body_parts.append(
+            f"✅ Automatically applied to {count_applied} job{'s' if count_applied != 1 else ''} on your behalf "
+            f"(contact email was found in the posting)."
+        )
+    else:
+        body_parts.append(
+            "No contact emails were found in these postings, so no auto-applications were sent this run. "
+            "You can apply directly via the links below."
+        )
+
+    body_parts += [
+        "",
+        f"Top {len(top)} matches (sorted by your profile match score):",
+        "",
+    ]
+    body_parts.extend(lines)
+    body_parts += [
+        "",
+        f"View all jobs and track interviews on your dashboard:",
+        "https://jobhawk-sbp1.onrender.com/dashboard",
+        "",
+        "— JobHawk",
+    ]
+
+    if opt_out_url:
+        body_parts += [
+            "",
+            "─────────────────────────────────",
+            f"To stop receiving these scan-result emails, click here:",
+            opt_out_url,
+        ]
+
+    body = "\n".join(body_parts)
+
     msg = MIMEMultipart()
     msg["From"]    = f"JobHawk <{from_email}>"
     msg["To"]      = to_email
-    msg["Subject"] = f"JobHawk applied to {count} job{'s' if count!=1 else ''} for you"
+    msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
-    _smtp_send(msg, from_email, password)
+
+    sent = _smtp_send(msg, from_email, password, smtp_host, smtp_port)
+    if sent:
+        log.info("Scan digest sent to %s (%d found, %d applied)", to_email, count_found, count_applied)
+    return sent
 
 
 def notify_interview(user, job, platform_email=None, platform_password=None):

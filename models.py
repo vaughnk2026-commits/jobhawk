@@ -170,6 +170,14 @@ def user_all_ids() -> List[int]:
     return [r["id"] for r in rows]
 
 
+def user_update_notify(uid: int, value: int):
+    """Enable (1) or disable (0) scan-result email notifications for a user."""
+    with _lock:
+        with _db() as c:
+            c.execute("UPDATE users SET notify_email=? WHERE id=?", (value, uid))
+            c.commit()
+
+
 # ── Profiles ──────────────────────────────────────────────────────────────────
 
 def profile_get(uid: int) -> Dict:

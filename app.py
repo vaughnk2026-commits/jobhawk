@@ -10,6 +10,8 @@ import re
 import threading
 from pathlib import Path
 
+import hashlib
+import hmac
 from dotenv import load_dotenv
 from flask import (
     Flask, Response, jsonify, redirect, render_template,
@@ -149,16 +151,24 @@ def _process_user(uid, raw_jobs):
                 applied.append(j)
                 apply_cap -= 1
 
-    if applied and user.get("notify_email"):
-        # Try platform email first, fall back to user's own SMTP credentials
-        p_email = os.environ.get("EMAIL_FROM", "")
-        p_pass  = os.environ.get("EMAIL_PASSWORD", "")
-        if not p_email or not p_pass:
-            p_email = profile.get("email_from", "")
-            p_pass  = profile.get("email_password", "")
-        if p_email and p_pass:
-            mailer.notify_user_digest(user, profile, applied, p_email, p_pass)
+    # Send scan-results email whenever jobs were found (even if 0 auto-applied)
+    # Uses user's own email credentials; falls back to platform env vars
+    scored_jobs = [j for j in enriched if j.get("match_score", 0) >= min_score]
+    if scored_jobs and user.get("notify_email", 1):
+        host = os.environ.get("RENDER_EXTERNAL_URL", "https://jobhawk-sbp1.onrender.com").rstrip("/")
+        opt_out = f"{host}/notifications/off?uid={uid}&token={_notify_token(uid)}"
+        mailer.notify_scan_results(user, profile, scored_jobs, applied, opt_out)
 
+
+# ── Notification helpers ─────────────────────────────────────────────────────
+
+def _notify_token(uid: int) -> str:
+    """HMAC token for unsubscribe links — uses SECRET_KEY so it can't be forged."""
+    return hmac.new(
+        app.secret_key.encode(),
+        str(uid).encode(),
+        hashlib.sha256,
+    ).hexdigest()[:24]
 
 # ── Keep-alive (prevents Render free tier from spinning down) ─────────────────
 
@@ -175,6 +185,33 @@ def _keep_alive():
 @app.route("/ping")
 def ping():
     return "ok", 200
+
+@app.route("/notifications/off")
+def notifications_off():
+    uid   = request.args.get("uid", type=int)
+    token = request.args.get("token", "")
+    if not uid or not token:
+        return "Invalid link.", 400
+    try:
+        expected = _notify_token(uid)
+    except Exception:
+        return "Invalid link.", 400
+    if not hmac.compare_digest(token, expected):
+        return "Invalid or expired link.", 400
+    models.user_update_notify(uid, 0)
+    return (
+        "<html><body style='font-family:sans-serif;max-width:480px;margin:60px auto;text-align:center'>"
+        "<h2>✅ Unsubscribed</h2>"
+        "<p>You've been unsubscribed from JobHawk scan-result emails.</p>"
+        "<p>You can re-enable them any time from your <a href='/dashboard'>dashboard</a>.</p>"
+        "</body></html>"
+    ), 200
+
+@app.route("/notifications/on")
+@login_required
+def notifications_on():
+    models.user_update_notify(current_user.id, 1)
+    return redirect(url_for("dashboard"))
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -232,11 +269,13 @@ def onboard_page():
 def onboard_post():
     def split(s):
         return [x.strip() for x in re.split(r"[,\n]+", s or "") if x.strip()]
-    country  = request.form.get("country", "").strip()
-    province = request.form.get("province", "").strip()
-    city     = request.form.get("city", "").strip()
+    country      = request.form.get("country", "").strip()
+    province     = request.form.get("province", "").strip()
+    city         = request.form.get("city", "").strip()
+    notify_email = 1 if request.form.get("notify_email") else 0
     # Build legacy location string for backward compat with scoring
     location = ", ".join(p for p in [city, province, country] if p)
+    models.user_update_notify(current_user.id, notify_email)
     models.profile_update(current_user.id,
         country       = country,
         province      = province,

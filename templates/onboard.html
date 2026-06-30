@@ -139,6 +139,24 @@
         </div>
       </div>
 
+      <!-- Email notifications opt-out -->
+      <div class="card" style="margin-bottom:24px">
+        <h3 style="font-weight:700;margin-bottom:4px">7. Scan-result email notifications</h3>
+        <p style="color:#64748b;font-size:.85rem;margin-bottom:14px">
+          After every scan, JobHawk can email you a summary of jobs found and applications submitted.
+          Uses your email credentials above.
+        </p>
+        <label style="display:flex;align-items:center;gap:12px;cursor:pointer">
+          <input type="checkbox" name="notify_email" value="1"
+            {% if profile.get('notify_email', 1) != 0 %}checked{% endif %}
+            style="width:18px;height:18px;accent-color:#3b82f6">
+          <span style="font-size:.9rem">Send me a scan-result email after each job scan</span>
+        </label>
+        <p style="color:#475569;font-size:.78rem;margin-top:8px">
+          You can unsubscribe at any time via the link in any notification email, or uncheck this box.
+        </p>
+      </div>
+
       <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center;padding:14px">
         Save Profile &amp; Go to Dashboard →
       </button>
