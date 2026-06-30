@@ -89,15 +89,16 @@ def notify_scan_results(user: Dict, profile: Dict, found_jobs: List[Dict],
                         applied_jobs: List[Dict], opt_out_url: str = "") -> bool:
     """
     Send the user a scan-results email every time jobs are found.
-    Uses the user's own SMTP credentials (email_from / email_password).
-    Falls back to EMAIL_FROM / EMAIL_PASSWORD env vars.
-    Always sends — regardless of whether auto-apply ran.
+    ALWAYS sends from the platform email (EMAIL_FROM / EMAIL_PASSWORD env vars).
+    The user's own credentials in their profile are only for sending job applications
+    to employers — NOT for receiving notifications.
     """
     to_email   = user.get("email", "")
-    from_email = (profile.get("email_from") or "").strip() or os.environ.get("EMAIL_FROM", "")
-    password   = (profile.get("email_password") or "").strip() or os.environ.get("EMAIL_PASSWORD", "")
-    smtp_host  = profile.get("smtp_host", "smtp.gmail.com") or "smtp.gmail.com"
-    smtp_port  = int(profile.get("smtp_port") or 587)
+    # Platform sender — set EMAIL_FROM and EMAIL_PASSWORD as Render env vars
+    from_email = os.environ.get("EMAIL_FROM", "")
+    password   = os.environ.get("EMAIL_PASSWORD", "")
+    smtp_host  = os.environ.get("EMAIL_SMTP_HOST", "smtp.gmail.com")
+    smtp_port  = int(os.environ.get("EMAIL_SMTP_PORT", "587"))
 
     if not to_email or not from_email or not password:
         log.debug("notify_scan_results: missing credentials — skipping (to=%s from=%s)", to_email, from_email)
@@ -180,6 +181,8 @@ def notify_interview(user, job, platform_email=None, platform_password=None):
     to_email   = user.get("email")
     from_email = platform_email or os.environ.get("EMAIL_FROM","")
     password   = platform_password or os.environ.get("EMAIL_PASSWORD","")
+    smtp_host  = os.environ.get("EMAIL_SMTP_HOST", "smtp.gmail.com")
+    smtp_port  = int(os.environ.get("EMAIL_SMTP_PORT", "587"))
     if not to_email or not from_email or not password: return
     name = user.get("name") or "there"
     body = (f"Hi {name},\n\nInterview opportunity:\n\n"
@@ -190,4 +193,4 @@ def notify_interview(user, job, platform_email=None, platform_password=None):
     msg["To"]      = to_email
     msg["Subject"] = f"Interview: {job.get('title','?')} at {job.get('company','?')}"
     msg.attach(MIMEText(body, "plain"))
-    _smtp_send(msg, from_email, password)
+    _smtp_send(msg, from_email, password, smtp_host, smtp_port)
