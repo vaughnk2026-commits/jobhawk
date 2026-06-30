@@ -125,21 +125,20 @@ def _run_scan():
 
 
 def _process_user(uid, raw_jobs):
-    user    = models.user_by_id(uid)
-    profile = models.profile_get(uid)
-    if not profile.get("resume_name"):
-        return   # not onboarded yet
-    enriched  = scorer.enrich_jobs(raw_jobs, profile)
-    min_score = int(profile.get("min_score") or 10)
-    applied   = []
-    apply_cap = MAX_APPLY_PER_RUN
+    user       = models.user_by_id(uid)
+    profile    = models.profile_get(uid)
+    has_resume = bool(profile.get("resume_name"))
+    enriched   = scorer.enrich_jobs(raw_jobs, profile)
+    min_score  = int(profile.get("min_score") or 10)
+    applied    = []
+    apply_cap  = MAX_APPLY_PER_RUN
 
     for j in enriched:
         if j.get("match_score", 0) < min_score:
             continue
-        jid = models.job_upsert(uid, j)
-        if apply_cap <= 0:
-            continue   # still store jobs, just don't email
+        jid = models.job_upsert(uid, j)   # always store — even without a resume
+        if not has_resume or apply_cap <= 0:
+            continue   # skip auto-apply if no resume or cap hit
         with models._db() as c:
             row = c.execute("SELECT status FROM jobs WHERE id=? AND user_id=?",
                             (jid, uid)).fetchone()

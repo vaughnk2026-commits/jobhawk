@@ -50,6 +50,12 @@
     </div>
   </div>
 
+  <!-- Resume nudge banner -->
+  <div id="nudge-resume" style="display:none;background:#1e3a1e;border:1px solid #16a34a;border-radius:10px;padding:12px 18px;margin-bottom:16px;font-size:.85rem;color:#86efac">
+    📄 <strong>Upload your resume</strong> to enable auto-applying — JobHawk is already finding jobs for you below, but can't submit applications without it.
+    <button onclick="document.getElementById('inp-resume').click()" class="btn btn-primary btn-sm" style="margin-left:12px">Upload Resume</button>
+  </div>
+
   <!-- File uploads -->
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:22px">
     <div id="dz-resume" onclick="document.getElementById('inp-resume').click()"
@@ -257,9 +263,13 @@ async function loadStatus() {
     document.getElementById('status-indicator').style.display = _running ? 'inline' : 'none';
     document.getElementById('btn-scan').style.display = _running ? 'none' : 'inline-flex';
     document.getElementById('btn-stop').style.display = _running ? 'inline-flex' : 'none';
+    const nudge = document.getElementById('nudge-resume');
     if (d.resume_name) {
       document.getElementById('dz-resume').classList.add('has-file');
       document.getElementById('dz-resume-lbl').textContent = '✅ ' + d.resume_name;
+      if (nudge) nudge.style.display = 'none';
+    } else {
+      if (nudge) nudge.style.display = 'block';
     }
     if (d.cover_letter_name) {
       document.getElementById('dz-cl').classList.add('has-file');

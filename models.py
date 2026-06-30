@@ -4,15 +4,34 @@ All tables scoped by user_id so each user's data is fully isolated.
 """
 
 import json
+import os
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
-BASE    = Path(__file__).resolve().parent
-DATA    = BASE / "data"
-DATA.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA / "jobhawk.db"
+BASE = Path(__file__).resolve().parent
+
+# Use DATABASE_PATH env var if set.
+# Otherwise try /var/data/ (Render persistent disk mount point),
+# then fall back to local data/ directory.
+_db_env = os.environ.get("DATABASE_PATH", "")
+if _db_env:
+    DB_PATH = Path(_db_env)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+else:
+    for _candidate in [Path("/var/data"), BASE / "data"]:
+        try:
+            _candidate.mkdir(parents=True, exist_ok=True)
+            # Quick write test
+            _test = _candidate / ".writable"
+            _test.write_text("1"); _test.unlink()
+            DB_PATH = _candidate / "jobhawk.db"
+            break
+        except Exception:
+            continue
+    else:
+        DB_PATH = BASE / "data" / "jobhawk.db"
 
 _lock = threading.Lock()
 
