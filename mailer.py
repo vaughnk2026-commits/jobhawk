@@ -22,11 +22,18 @@ def _smtp_send(msg, from_email, password, host="smtp.gmail.com", port=587) -> bo
     old_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(SMTP_TIMEOUT)
     try:
-        with smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT) as srv:
-            srv.ehlo()
-            srv.starttls()
-            srv.login(from_email, password)
-            srv.send_message(msg)
+        if int(port) == 465:
+            # SSL connection — used by Resend and other modern providers
+            with smtplib.SMTP_SSL(host, int(port), timeout=SMTP_TIMEOUT) as srv:
+                srv.login(from_email, password)
+                srv.send_message(msg)
+        else:
+            # STARTTLS connection — used by Gmail (port 587) etc.
+            with smtplib.SMTP(host, int(port), timeout=SMTP_TIMEOUT) as srv:
+                srv.ehlo()
+                srv.starttls()
+                srv.login(from_email, password)
+                srv.send_message(msg)
         return True
     except Exception as e:
         log.warning("SMTP send failed (%s:%s): %s", host, port, e)
@@ -94,7 +101,6 @@ def notify_scan_results(user: Dict, profile: Dict, found_jobs: List[Dict],
     to employers — NOT for receiving notifications.
     """
     to_email   = user.get("email", "")
-    # Platform sender — set EMAIL_FROM and EMAIL_PASSWORD as Render env vars
     from_email = os.environ.get("EMAIL_FROM", "")
     password   = os.environ.get("EMAIL_PASSWORD", "")
     smtp_host  = os.environ.get("EMAIL_SMTP_HOST", "smtp.gmail.com")
@@ -108,12 +114,10 @@ def notify_scan_results(user: Dict, profile: Dict, found_jobs: List[Dict],
     count_found   = len(found_jobs)
     count_applied = len(applied_jobs)
 
-    # Subject line
     subject = f"JobHawk: {count_found} job{'s' if count_found != 1 else ''} found for you"
     if count_applied:
         subject += f" · {count_applied} applied"
 
-    # Body
     top = found_jobs[:25]
     lines = []
     for i, j in enumerate(top, 1):
@@ -141,27 +145,19 @@ def notify_scan_results(user: Dict, profile: Dict, found_jobs: List[Dict],
             "You can apply directly via the links below."
         )
 
-    body_parts += [
-        "",
-        f"Top {len(top)} matches (sorted by your profile match score):",
-        "",
-    ]
+    body_parts += ["", f"Top {len(top)} matches:", ""]
     body_parts.extend(lines)
     body_parts += [
         "",
-        f"View all jobs and track interviews on your dashboard:",
+        "View all jobs on your dashboard:",
         "https://jobhawk-sbp1.onrender.com/dashboard",
         "",
         "— JobHawk",
     ]
 
     if opt_out_url:
-        body_parts += [
-            "",
-            "─────────────────────────────────",
-            f"To stop receiving these scan-result emails, click here:",
-            opt_out_url,
-        ]
+        body_parts += ["", "─────────────────────────────────",
+                       "To stop receiving these emails:", opt_out_url]
 
     body = "\n".join(body_parts)
 
