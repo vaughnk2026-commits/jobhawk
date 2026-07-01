@@ -1,5 +1,5 @@
 """
-JobHawk SaaS — Multi-user job search automation platform.
+JobHawk SaaS â Multi-user job search automation platform.
 Email/password login + optional WebAuthn passkey authentication.
 """
 
@@ -20,7 +20,7 @@ from flask_login import (
     LoginManager, UserMixin, current_user,
     login_required, login_user, logout_user,
 )
-from passlib.hash import bcrypt as _bcrypt
+from werkzeug.security import generate_password_hash as _gen_pw, check_password_hash as _check_pw
 from apscheduler.schedulers.background import BackgroundScheduler
 
 import models
@@ -30,7 +30,7 @@ import mailer
 
 load_dotenv()
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# ââ Paths âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 BASE    = Path(__file__).resolve().parent
 UPLOADS = BASE / "uploads"
@@ -38,7 +38,7 @@ LOGS    = BASE / "logs"
 for _d in [UPLOADS, LOGS]:
     _d.mkdir(parents=True, exist_ok=True)
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ââ Logging âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 logging.basicConfig(
     filename=LOGS / "jobhawk.log",
@@ -47,7 +47,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Flask setup ───────────────────────────────────────────────────────────────
+# ââ Flask setup âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(32))
@@ -57,14 +57,14 @@ login_manager = LoginManager(app)
 login_manager.login_view = "login_page"
 login_manager.login_message = "Please sign in to continee."
 
-# WebAuthn config — set RP_ID to your actual domain in production
+# WebAuthn config â set RP_ID to your actual domain in production
 RP_ID     = os.environ.get("RP_ID", "localhost")
 RP_NAME   = "JobHawk"
 WA_ORIGIN = os.environ.get("WA_ORIGIN", f"https://{RP_ID}")
 
 models.init_db()
 
-# ── Flask-Login user object ───────────────────────────────────────────────────
+# ââ Flask-Login user object âââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 class User(UserMixin):
     def __init__(self, row: dict):
@@ -78,7 +78,7 @@ def load_user(uid):
     return User(row) if row else None
 
 
-# ── Scan state (in-memory, global) ───────────────────────────────────────────
+# ââ Scan state (in-memory, global) âââââââââââââââââââââââââââââââââââââââââââ
 
 _scan_state = {
     "running": False,
@@ -89,14 +89,14 @@ _scan_state = {
 _scan_lock = threading.Lock()
 
 
-# ── Background scan ───────────────────────────────────────────────────────────
+# ââ Background scan âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def _run_scan():
     with _scan_lock:
         if _scan_state["running"]:
             return
         _scan_state["running"]     = True
-        _scan_state["last_status"] = "Running…"
+        _scan_state["last_status"] = "Runningâ¦"
 
     try:
         log.info("Global scan started")
@@ -112,7 +112,7 @@ def _run_scan():
         now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with _scan_lock:
             _scan_state["last_ran"]    = now
-            _scan_state["last_status"] = f"Done — {len(raw_jobs)} jobs scraped, {now}"
+            _scan_state["last_status"] = f"Done â {len(raw_jobs)} jobs scraped, {now}"
             _scan_state["run_count"]  += 1
         log.info("Global scan done: %d raw jobs", len(raw_jobs))
 
@@ -163,7 +163,7 @@ def _process_user(uid: int, raw_jobs: list):
             else:
                 models.job_mark_applied(uid, jid)
         elif is_new:
-            # No contact email — still mark as tracked so it's not re-processed
+            # No contact email â still mark as tracked so it's not re-processed
             models.job_mark_applied(uid, jid)
 
     # Send digest for ALL new jobs found this run (not just emailed ones)
@@ -171,7 +171,7 @@ def _process_user(uid: int, raw_jobs: list):
         mailer.notify_user_digest(user, profile, new_jobs_this_run)
 
 
-# ── Auth routes ───────────────────────────────────────────────────────────────
+# ââ Auth routes âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 @app.route("/")
 def home():
@@ -194,7 +194,7 @@ def login_post():
     row      = models.user_by_email(email)
     if not row or not row.get("password_hash"):
         return render_template("login.html", error="Invalid email or password.")
-    if not _bcrypt.verify(password, row["password_hash"]):
+    if not _check_pw(row["password_hash"], password):
         return render_template("login.html", error="Invalid email or password.")
     login_user(User(row), remember=True)
     return redirect(url_for("dashboard"))
@@ -219,7 +219,7 @@ def signup_post():
         )
     if models.user_by_email(email):
         return render_template("signup.html", error="That email is already registered.")
-    ph  = _bcrypt.hash(password)
+    ph  = _gen_pw(password)
     uid = models.user_create(email, ph, name)
     row = models.user_by_id(uid)
     login_user(User(row), remember=True)
@@ -233,7 +233,7 @@ def logout():
     return redirect(url_for("login_page"))
 
 
-# ── Onboarding ────────────────────────────────────────────────────────────────
+# ââ Onboarding ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 @app.route("/onboard")
 @login_required
@@ -267,7 +267,7 @@ def onboard_post():
     return redirect(url_for("dashboard"))
 
 
-# ── Dashboard ─────────────────────────────────────────────────────────────────
+# ââ Dashboard âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 @app.route("/dashboard")
 @login_required
@@ -283,7 +283,7 @@ def dashboard():
     )
 
 
-# ── User API ──────────────────────────────────────────────────────────────────
+# ââ User API ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 @app.route("/api/status")
 @login_required
@@ -425,7 +425,7 @@ def api_profile_post():
     return jsonify({"ok": True})
 
 
-# ── WebAuthn (Passkeys) ───────────────────────────────────────────────────────
+# ââ WebAuthn (Passkeys) âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def _wa_available():
     try:
@@ -547,7 +547,7 @@ def passkey_authenticate_complete():
         return jsonify({"error": str(e)}), 400
 
 
-# ── Scheduler ─────────────────────────────────────────────────────────────────
+# ââ Scheduler âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(_run_scan, "interval", minutes=15, id="global_scan")
